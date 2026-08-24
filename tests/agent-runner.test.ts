@@ -29,6 +29,20 @@ describe('agent-runner', () => {
       expect(runner.runStream).toBeDefined();
     });
 
+    it('should create GrokRunner for grok backend', () => {
+      const runner = createAgentRunner('grok', {});
+      expect(runner).toBeDefined();
+      expect(runner.run).toBeDefined();
+      expect(runner.runStream).toBeDefined();
+    });
+
+    it('should create AntigravityRunner for antigravity backend', () => {
+      const runner = createAgentRunner('antigravity', {});
+      expect(runner).toBeDefined();
+      expect(runner.run).toBeDefined();
+      expect(runner.runStream).toBeDefined();
+    });
+
     it('should throw error for unknown backend', () => {
       expect(() => createAgentRunner('unknown' as any, {})).toThrow('Unknown agent backend');
     });
@@ -137,6 +151,14 @@ describe('agent-runner', () => {
 
     it('should return "Cursor" for cursor', () => {
       expect(getBackendDisplayName('cursor')).toBe('Cursor');
+    });
+
+    it('should return "Grok" for grok', () => {
+      expect(getBackendDisplayName('grok')).toBe('Grok');
+    });
+
+    it('should return "Antigravity" for antigravity', () => {
+      expect(getBackendDisplayName('antigravity')).toBe('Antigravity');
     });
   });
 });

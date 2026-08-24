@@ -109,7 +109,7 @@ fires. The button **doubles the remaining time** at the moment of the click.
 - `延長` is disabled / hidden once the cap is reached
 
 Supported backends: Claude Code (persistent-runner), Codex CLI, Cursor CLI,
-Gemini CLI legacy, Local LLM, Dynamic Runner (forwards to inner runner).
+Local LLM, Dynamic Runner (forwards to inner runner).
 
 Programmatic API:
 
@@ -304,17 +304,21 @@ When `TRIGGER_ENABLED=true`, this usage is also injected into the agent's own sy
 
 ## Runtime Settings
 
-Runtime settings are saved in `${WORKSPACE_PATH}/settings.json`.
+Runtime settings are saved in `${DATA_DIR}/settings.json` (default: `${WORKSPACE_PATH}/.xangi/settings.json`).
 
 ```json
 {
-  "autoRestart": true
+  "autoRestart": true,
+  "discordCompletionNotifyChannels": {
+    "123456789012345678": "mention"
+  }
 }
 ```
 
 | Setting | Description | Default |
 | --- | --- | --- |
 | `autoRestart` | Allow AI agent to trigger restarts | `true` |
+| `discordCompletionNotifyChannels` | Per-channel completion notification overrides (`off` / `message` / `mention`) | none |
 
 ### Viewing and Changing Settings
 
@@ -323,6 +327,7 @@ Runtime settings are saved in `${WORKSPACE_PATH}/settings.json`.
 | `/settings` | Show current settings |
 | `/restart` | Restart the bot |
 | `/autoreply` | Toggle mention-free auto-reply for this channel (no restart needed) |
+| `/notify <off\|message\|mention\|default\|show>` | Configure completion notifications for this channel (no restart needed, persisted to `settings.json`) |
 | `/respondtobots` | Toggle bot-to-bot reply ON/OFF (whitelist set via `RESPOND_TO_BOTS` env) |
 | `/llmmode <agent\|lite\|chat\|default\|show>` | Switch this channel's Local LLM operation mode (persisted to `CHANNEL_OVERRIDES` in `.env`) |
 
@@ -335,6 +340,7 @@ You can switch the backend, model, and effort level per channel.
 | `/backend show` | Show the current backend and model |
 | `/backend set claude-code` | Switch to Claude Code |
 | `/backend set cursor` | Switch to Cursor CLI |
+| `/backend set grok` | Switch to Grok CLI |
 | `/backend set local-llm --model nemotron-3-nano` | Switch to Local LLM with a specific model |
 | `/backend set claude-code --effort high` | Switch with a specific effort level |
 | `/backend reset` | Reset to the default (.env settings) |
@@ -345,8 +351,8 @@ Switching always starts a new session (conversation history is not carried over)
 #### Restricting via Environment Variables
 
 ```bash
-# Allowed backends for switching (if unset, switching is disabled)
-ALLOWED_BACKENDS=claude-code,cursor,local-llm
+# Allowed backends for switching (if unset, all backends are allowed)
+ALLOWED_BACKENDS=claude-code,cursor,grok,antigravity,local-llm
 
 # Allowed models for switching (if unset, no restriction)
 ALLOWED_MODELS=nemotron-3-nano,nemotron-3-super,qwen3.5:9b
@@ -378,6 +384,8 @@ The AI can edit the `.env` file to change settings:
 
 You can also use the `/autoreply` command to toggle mention-free auto-reply per channel (no restart needed, persisted to `.env`).
 To disable this command, set `ALLOW_AUTOREPLY_COMMAND=false` in `.env` (default: enabled).
+
+Use `/notify` to configure separate completion notifications for long Discord turns per channel. `DISCORD_COMPLETION_NOTIFY` is the startup default, while channel overrides are stored in `settings.json`. This applies only to normal Discord message turns; scheduler-triggered turns do not send completion notifications.
 
 ### Responding to Other Bots (A/B Comparison)
 
@@ -492,7 +500,7 @@ Run in a container-isolated environment. Three containers are available:
 
 | Container | Dockerfile | Purpose |
 |---|---|---|
-| `xangi` | `Dockerfile` | Lightweight (Claude Code / Codex / Cursor CLI / Gemini CLI legacy) |
+| `xangi` | `Dockerfile` | Lightweight (Claude Code / Codex / Cursor CLI / Grok CLI) |
 | `xangi-max` | `Dockerfile.max` | Full version (uv + Python support, for Local LLM) |
 | `xangi-gpu` | `Dockerfile.gpu` | GPU version (CUDA + PyTorch, for image generation / audio processing) |
 
@@ -503,6 +511,18 @@ docker compose up xangi -d --build
 
 # Claude Code authentication
 docker exec -it xangi claude
+```
+
+To run Claude Code with Anthropic API-key billing, set `ANTHROPIC_API_KEY` in `.env`.
+This value is passed only to the Claude Code child process and is not part of the general safe environment whitelist.
+Set `CLAUDE_CODE_BARE=true` when you want to force API-key auth instead of OAuth/keychain auth.
+Set `CLAUDE_CODE_MAX_BUDGET_USD` to cap API spend for each Claude Code print-mode run.
+
+```env
+AGENT_BACKEND=claude-code
+ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_CODE_BARE=true
+CLAUDE_CODE_MAX_BUDGET_USD=0.25
 ```
 
 ### Local LLM Backend (Ollama)
@@ -941,6 +961,8 @@ Environment variables passed to the AI agent (CLI spawn / Local LLM exec) are ma
 
 **Allowed variables:** `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `TZ`, `NODE_ENV`, `NODE_PATH`, `WORKSPACE_PATH`, `AGENT_BACKEND`, `AGENT_MODEL`, `SKIP_PERMISSIONS`, `DATA_DIR`, `XANGI_TOOL_SERVER`, `XANGI_CHANNEL_ID`
 
+`ANTHROPIC_API_KEY`, `CURSOR_API_KEY`, and `XAI_API_KEY` are not part of the general whitelist. They are passed only to Claude Code, Cursor CLI, and Grok CLI child processes respectively.
+
 **Not passed (examples):** `DISCORD_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `LOCAL_LLM_API_KEY`, `GH_TOKEN`
 
 To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
@@ -962,6 +984,8 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `DISCORD_SHOW_LIVE_TOOL_USE` | Show raw tool history while running | `true` |
 | `TOOL_HISTORY_MAX_LINES` | Max tool history lines shown (older lines collapse into a `… (+N 件省略)` summary line; `0` or less for unlimited) | `10` |
 | `DISCORD_SHOW_TOOL_USE` | Compatibility setting. `false` maps to `off`, `true` maps to `inline` | - |
+| `DISCORD_COMPLETION_NOTIFY` | Send a separate completion notification after long Discord turns (`off` / `message` / `mention`) | `message` |
+| `DISCORD_COMPLETION_NOTIFY_AFTER_MS` | Minimum elapsed time before sending a completion notification (ms) | `10000` |
 | `ALLOW_AUTOREPLY_COMMAND` | Enable `/autoreply` command | `true` |
 | `RESPOND_TO_BOTS` | Whitelist of bot IDs to respond to (`*` for all bots) | - |
 | `RESPOND_TO_BOTS_ENABLED` | Toggle bot-to-bot reply ON/OFF (`/respondtobots` switches at runtime) | `false` |
@@ -975,7 +999,7 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AGENT_BACKEND` | Backend (`claude-code` / `codex` / `cursor` / `local-llm`; `gemini` is legacy/API-key use) | `claude-code` |
+| `AGENT_BACKEND` | Backend (`claude-code` / `codex` / `cursor` / `grok` / `local-llm`) | `claude-code` |
 | `AGENT_MODEL` | Model to use | - |
 | `WORKSPACE_PATH` | Working directory (local execution) | `./workspace` |
 | `XANGI_WORKSPACE` | Host-side workspace path (Docker execution) | `./workspace` |
@@ -985,12 +1009,16 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `XANGI_CONFIG_STRICT` | Escalate invalid env values (non-numeric, out of range, enum typos) to startup errors. Default is warn + fall back to defaults | `false` |
 | `TIMEOUT_MAX_MS` | Absolute upper limit for timeout extension (milliseconds) | `36000000` |
 | `TIMEOUT_EXTEND_ENABLED` | Enable / disable the `延長` button | `true` |
-| `ALLOWED_BACKENDS` | Allowed backends for `/backend` switching (comma-separated) | - |
+| `ALLOWED_BACKENDS` | Allowed backends for `/backend` switching (comma-separated). If unset, all backends are allowed | all backends |
 | `ALLOWED_MODELS` | Allowed models for `/backend` switching (comma-separated) | - |
 | `CHANNEL_OVERRIDES` | Per-channel backend settings (JSON) | - |
+| `ANTHROPIC_API_KEY` | Anthropic API key passed only to the Claude Code backend | - |
+| `CLAUDE_CODE_BARE` | Pass `--bare` to Claude Code and force API-key auth instead of OAuth/keychain auth | `false` |
+| `CLAUDE_CODE_MAX_BUDGET_USD` | Pass `--max-budget-usd` to Claude Code to cap API spend | - |
 | `CURSOR_API_KEY` | API key passed only to the Cursor CLI backend | - |
 | `CURSOR_FORCE` | Pass `--force` to Cursor CLI unless explicitly set to `false` | `true` |
 | `CURSOR_TRUST_WORKSPACE` | Pass `--trust` to Cursor CLI unless explicitly set to `false` | `true` |
+| `XAI_API_KEY` | API key passed only to the Grok CLI backend (not required when `grok login` is already configured) | - |
 | `PERSISTENT_MODE` | Persistent process mode | `true` |
 | `MAX_PROCESSES` | Maximum concurrent processes | `10` |
 | `IDLE_TIMEOUT_MS` | Auto-terminate idle processes after | `1800000` |
@@ -1042,7 +1070,7 @@ The Even UI only offers `claude` and `codex` provider labels. xangi accepts thos
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `XANGI_EVEN_TERMINAL_TOKEN` | Dedicated token for the Even Terminal compatibility API. Falls back to `XANGI_DEVICE_INBOX_TOKEN`, then `XANGI_PET_INBOX_TOKEN` when unset | (unset) |
-| `XANGI_EVEN_TERMINAL_BACKEND` | Backend default used only for Even Terminal traffic (`claude-code` / `codex` / `gemini` / `local-llm`) | `AGENT_BACKEND` |
+| `XANGI_EVEN_TERMINAL_BACKEND` | Backend default used only for Even Terminal traffic (`claude-code` / `codex` / `cursor` / `grok` / `local-llm`) | `AGENT_BACKEND` |
 | `XANGI_EVEN_TERMINAL_MODEL` | Model default used only for Even Terminal traffic | `AGENT_MODEL` / backend default |
 | `XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE` | Local LLM mode default used only for Even Terminal traffic (`agent` / `lite` / `chat`) | `LOCAL_LLM_MODE` / `agent` |
 
@@ -1072,12 +1100,6 @@ Without these settings, existing `gh` authentication (`gh auth login` / `GH_TOKE
 - Token generation is performed via the tool-server's HTTP endpoint (`/github-token`), and the AI agent can only obtain short-lived installation tokens (valid for 1 hour)
 - If token generation fails, it does NOT fall back to PAT — it errors out
 
-### Gemini CLI (when `AGENT_BACKEND=gemini`)
-
-The Gemini CLI backend is a legacy backend kept for compatibility and Enterprise / Google Cloud / paid API key use. Requests for Google AI Pro / Ultra / free Gemini Code Assist for individuals stop on 2026-06-18, so it is not recommended for new setups or normal operation.
-
-Existing installations rely on Gemini CLI's own authentication and auto-loading of `GEMINI.md`. On the xangi side, configure `AGENT_BACKEND=gemini` and optionally `AGENT_MODEL`.
-
 ### Cursor CLI (when `AGENT_BACKEND=cursor`)
 
 The Cursor CLI backend uses the `cursor-agent` command. Non-interactive runs use `cursor-agent -p ... --output-format json`; streaming uses `--output-format stream-json --stream-partial-output`.
@@ -1088,7 +1110,23 @@ The Cursor CLI backend passes `--trust` by default so non-interactive xangi runs
 
 The Cursor CLI backend also passes `--force` by default, matching xangi's default `SKIP_PERMISSIONS=true` behavior for Codex / Claude Code and avoiding permission waits in non-interactive chat runs. Set `CURSOR_FORCE=false` for interactive use or untrusted workspaces.
 
-Antigravity CLI (`agy`) is not exposed as an xangi backend for now. xangi will not provide `AGENT_BACKEND=antigravity` until an official machine-readable JSON/stream output contract is available.
+### Grok CLI (when `AGENT_BACKEND=grok`)
+
+The Grok CLI backend uses xAI's `grok` command. Non-interactive runs use `grok --no-auto-update -p ... --output-format json`; streaming uses `--output-format streaming-json`.
+
+Authentication depends on a local `grok login` session or `XAI_API_KEY`. `XAI_API_KEY` is passed only to the Grok CLI child process.
+
+When `SKIP_PERMISSIONS=true` (the default), xangi passes `--always-approve` to avoid tool approval prompts in non-interactive chat runs. This is intended for personal use in trusted workspaces.
+
+### Antigravity CLI (`AGENT_BACKEND=antigravity`)
+
+The Antigravity backend uses Google's `agy` command. Install it with `curl -fsSL https://antigravity.google/cli/install.sh | bash` and complete the first-run `agy` authentication flow.
+
+Non-interactive execution uses `agy -p ...`. xangi passes `--model` when `AGENT_MODEL` is set and `--conversation` when a provider session id is available.
+
+When `SKIP_PERMISSIONS=true` (the default), xangi passes `--dangerously-skip-permissions` to avoid blocking on permission prompts in non-interactive chat operation. Use this only for trusted personal workspaces.
+
+Because Antigravity CLI does not currently expose a stable JSON/stream-json contract, xangi emits the final response once as a streaming fallback. The runner can be extended to incremental display when `agy` adds a machine-readable stream output.
 
 ### Local LLM (when `AGENT_BACKEND=local-llm`)
 

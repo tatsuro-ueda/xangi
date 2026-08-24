@@ -62,17 +62,13 @@ describe('EnvValidator', () => {
   describe('enumOf', () => {
     it('大文字小文字を無視してマッチする', () => {
       const v = new EnvValidator({ LOCAL_LLM_MODE: 'AGENT' });
-      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent')).toBe(
-        'agent'
-      );
+      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent')).toBe('agent');
       expect(v.issues).toHaveLength(0);
     });
 
     it('typo はデフォルトにフォールバックして issue を記録', () => {
       const v = new EnvValidator({ LOCAL_LLM_MODE: 'agnet' });
-      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent')).toBe(
-        'agent'
-      );
+      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent')).toBe('agent');
       expect(v.issues).toHaveLength(1);
       expect(v.issues[0].message).toContain('agent / lite / chat');
     });
@@ -81,13 +77,19 @@ describe('EnvValidator', () => {
   describe('enumList', () => {
     it('未設定なら undefined', () => {
       const v = new EnvValidator({});
-      expect(v.enumList('ALLOWED_BACKENDS', ['codex', 'gemini'] as const)).toBeUndefined();
+      expect(v.enumList('ALLOWED_BACKENDS', ['codex', 'grok'] as const)).toBeUndefined();
     });
 
     it('typo の項目だけ除外して有効な項目を残す', () => {
       const v = new EnvValidator({ ALLOWED_BACKENDS: 'codex,gemnii,local-llm' });
       expect(
-        v.enumList('ALLOWED_BACKENDS', ['claude-code', 'codex', 'gemini', 'local-llm'] as const)
+        v.enumList('ALLOWED_BACKENDS', [
+          'claude-code',
+          'codex',
+          'grok',
+          'antigravity',
+          'local-llm',
+        ] as const)
       ).toEqual(['codex', 'local-llm']);
       expect(v.issues).toHaveLength(1);
       expect(v.issues[0].value).toBe('gemnii');
@@ -159,7 +161,7 @@ describe('validateChannelOverrides', () => {
     const raw = JSON.stringify({
       '111': { backend: 'codex', effort: 'ultra' },
       '222': { backend: 'local-llm', localLlmMode: 'turbo' },
-      '333': { backend: 'gemini' },
+      '333': { backend: 'grok' },
     });
     const { overrides, issues } = validateChannelOverrides(raw);
     expect(Object.keys(overrides!)).toEqual(['333']);

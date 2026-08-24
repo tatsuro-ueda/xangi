@@ -108,7 +108,7 @@ INJECT_TIMESTAMP=false
 対応バックエンド:
 
 - Claude Code (`persistent-runner`): タイマーをスケジュール再設定して延長
-- Codex / Gemini legacy: 子プロセスの kill タイマーを再設定
+- Codex / Cursor / Grok: 子プロセスの kill タイマーを再設定
 - Local LLM: AbortController を最新参照経由で延長
 - Dynamic Runner: 内部 Runner にパススルー
 
@@ -323,13 +323,17 @@ docker build -t myapp . && \
 
 ```json
 {
-  "autoRestart": true
+  "autoRestart": true,
+  "discordCompletionNotifyChannels": {
+    "123456789012345678": "mention"
+  }
 }
 ```
 
-| 設定          | 説明                             | デフォルト |
-| ------------- | -------------------------------- | ---------- |
-| `autoRestart` | AIエージェントによる再起動を許可 | `true`     |
+| 設定 | 説明 | デフォルト |
+| ---- | ---- | ---------- |
+| `autoRestart` | AIエージェントによる再起動を許可 | `true` |
+| `discordCompletionNotifyChannels` | チャンネルごとの完了通知 override（`off` / `message` / `mention`） | なし |
 
 ### 設定の確認・変更
 
@@ -338,6 +342,7 @@ docker build -t myapp . && \
 | `/settings`  | 現在の設定を表示                               |
 | `/restart`   | ボットを再起動                                 |
 | `/autoreply` | このチャンネルのメンションなし応答をトグル（再起動不要） |
+| `/notify <off\|message\|mention\|default\|show>` | このチャンネルの完了通知を切替（再起動不要、`settings.json` に永続化） |
 | `/respondtobots` | bot メッセージへの応答を ON/OFF トグル（反応対象は `RESPOND_TO_BOTS` 環境変数で事前指定） |
 | `/llmmode <agent\|lite\|chat\|default\|show>` | このチャンネルの Local LLM 動作モードを per-channel で切替（`.env` の `CHANNEL_OVERRIDES` に永続化） |
 
@@ -350,6 +355,8 @@ docker build -t myapp . && \
 | `/backend show`                                   | 現在のバックエンド・モデルを表示       |
 | `/backend set claude-code`                        | Claude Codeに切り替え                  |
 | `/backend set cursor`                             | Cursor CLIに切り替え                   |
+| `/backend set grok`                               | Grok CLIに切り替え                     |
+| `/backend set antigravity`                        | Antigravity CLIに切り替え              |
 | `/backend set local-llm --model nemotron-3-nano`  | Local LLM + モデル指定                 |
 | `/backend set claude-code --effort high`          | effort指定付きで切り替え               |
 | `/backend reset`                                  | デフォルト（.env設定）に戻す           |
@@ -360,8 +367,8 @@ docker build -t myapp . && \
 #### 環境変数で制限
 
 ```bash
-# 切り替え許可バックエンド（未設定=切り替え不可）
-ALLOWED_BACKENDS=claude-code,cursor,local-llm
+# 切り替え許可バックエンド（未設定=全バックエンド許可）
+ALLOWED_BACKENDS=claude-code,cursor,grok,antigravity,local-llm
 
 # 切り替え許可モデル（未設定=制限なし）
 ALLOWED_MODELS=nemotron-3-nano,nemotron-3-super,qwen3.5:9b
@@ -393,6 +400,8 @@ AIは `.env` ファイルを編集して設定を変更できます：
 
 `/autoreply` コマンドでもメンションなし応答をチャンネルごとに切り替えられます（再起動不要、`.env` にも永続化）。
 このコマンドを無効にするには `.env` に `ALLOW_AUTOREPLY_COMMAND=false` を設定してください（デフォルト: 有効）。
+
+`/notify` コマンドで、長い Discord ターン完了時の別メッセージ通知をチャンネルごとに切り替えられます。起動時の `DISCORD_COMPLETION_NOTIFY` はデフォルト値として使われ、チャンネル override は `settings.json` に保存されます。対象は通常の Discord メッセージターンのみで、スケジュール起点ターンは通知しません。
 
 ### 他 bot のメッセージへの応答（A/B 比較等）
 
@@ -507,7 +516,7 @@ docker compose -f docker-compose.standalone.yml down
 
 | コンテナ | Dockerfile | 用途 |
 |---|---|---|
-| `xangi` | `Dockerfile` | 軽量版（Claude Code / Codex / Cursor CLI / Gemini CLI legacy） |
+| `xangi` | `Dockerfile` | 軽量版（Claude Code / Codex / Cursor CLI / Grok CLI） |
 | `xangi-max` | `Dockerfile.max` | フル版（uv + Python対応、Local LLM向け） |
 | `xangi-gpu` | `Dockerfile.gpu` | GPU版（CUDA + PyTorch、画像生成・音声処理向け） |
 
@@ -518,6 +527,18 @@ docker compose up xangi -d --build
 
 # Claude Code 認証
 docker exec -it xangi claude
+```
+
+Claude Code を Anthropic API key 課金で動かす場合は、`.env` に `ANTHROPIC_API_KEY` を設定します。
+この値は Claude Code 子プロセスにのみ渡され、通常の環境変数ホワイトリストには含めません。
+OAuth / keychain を使わず API key 認証に固定したい場合は `CLAUDE_CODE_BARE=true` を設定します。
+API 呼び出しの上限額を付けたい場合は `CLAUDE_CODE_MAX_BUDGET_USD` を設定します。
+
+```env
+AGENT_BACKEND=claude-code
+ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_CODE_BARE=true
+CLAUDE_CODE_MAX_BUDGET_USD=0.25
 ```
 
 ### Local LLM バックエンド（Ollama）
@@ -956,6 +977,8 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 
 **許可される変数:** `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `TZ`, `NODE_ENV`, `NODE_PATH`, `WORKSPACE_PATH`, `AGENT_BACKEND`, `AGENT_MODEL`, `SKIP_PERMISSIONS`, `DATA_DIR`, `XANGI_TOOL_SERVER`, `XANGI_CHANNEL_ID`
 
+`ANTHROPIC_API_KEY`、`CURSOR_API_KEY`、`XAI_API_KEY` は通常のホワイトリストには含めず、それぞれ Claude Code / Cursor CLI / Grok CLI の子プロセスにだけ渡されます。
+
 **渡されない変数（例）:** `DISCORD_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `LOCAL_LLM_API_KEY`, `GH_TOKEN`
 
 ホワイトリストを変更する場合は `src/safe-env.ts` の `ALLOWED_ENV_KEYS` を編集。
@@ -977,6 +1000,8 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 | `DISCORD_SHOW_LIVE_TOOL_USE` | 実行中だけ raw ツール履歴を表示 | `true` |
 | `TOOL_HISTORY_MAX_LINES` | ツール履歴の最大表示行数（超過分は `… (+N 件省略)`、`0` 以下で無制限） | `10` |
 | `DISCORD_SHOW_TOOL_USE` | 互換設定。`false` は `off`、`true` は `inline` として扱う | - |
+| `DISCORD_COMPLETION_NOTIFY` | 一定時間以上かかった Discord ターン完了時に別メッセージで通知（`off` / `message` / `mention`） | `message` |
+| `DISCORD_COMPLETION_NOTIFY_AFTER_MS` | 完了通知を出す最短経過時間（ms） | `10000` |
 | `ALLOW_AUTOREPLY_COMMAND` | `/autoreply` コマンドの有効化 | `true` |
 | `RESPOND_TO_BOTS` | 反応対象 bot ID のホワイトリスト（`*` で全 bot） | - |
 | `RESPOND_TO_BOTS_ENABLED` | bot メッセージ応答機能の ON/OFF（`/respondtobots` で動的切替） | `false` |
@@ -990,7 +1015,7 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 
 | 変数 | 説明 | デフォルト |
 |------|------|-----------|
-| `AGENT_BACKEND` | バックエンド（`claude-code` / `codex` / `cursor` / `local-llm`。`gemini` は legacy/API-key 用） | `claude-code` |
+| `AGENT_BACKEND` | バックエンド（`claude-code` / `codex` / `cursor` / `grok` / `antigravity` / `local-llm`） | `claude-code` |
 | `AGENT_MODEL` | 使用するモデル | - |
 | `WORKSPACE_PATH` | 作業ディレクトリ（ローカル実行時） | `./workspace` |
 | `XANGI_WORKSPACE` | ワークスペースのホスト側パス（Docker実行時） | `./workspace` |
@@ -1002,12 +1027,16 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 | `TIMEOUT_EXTEND_ENABLED` | 延長ボタン (`[延長]`) の有効/無効 | `true` |
 | `WEB_CHAT_UPLOAD_ACCEPT` | Web Chat 受信ファイル許可リスト（カンマ区切り、HTML `<input accept>` 互換） | 全許可 |
 | `WEB_CHAT_DOWNLOAD_ACCEPT` | Web Chat ダウンロード許可拡張子リスト（`.html,.txt` 等） | 全許可 |
-| `ALLOWED_BACKENDS` | `/backend` で切り替え許可するバックエンド（カンマ区切り） | - |
+| `ALLOWED_BACKENDS` | `/backend` で切り替え許可するバックエンド（カンマ区切り）。未設定なら全バックエンド許可 | 全バックエンド |
 | `ALLOWED_MODELS` | `/backend` で切り替え許可するモデル（カンマ区切り） | - |
 | `CHANNEL_OVERRIDES` | チャンネル別バックエンド設定（JSON） | - |
+| `ANTHROPIC_API_KEY` | Claude Code backend に渡す Anthropic API key（Claude Code利用時のみ） | - |
+| `CLAUDE_CODE_BARE` | Claude Code に `--bare` を渡し、OAuth/keychain ではなく API key 認証に固定 | `false` |
+| `CLAUDE_CODE_MAX_BUDGET_USD` | Claude Code に `--max-budget-usd` を渡し、API呼び出しの上限額を設定 | - |
 | `CURSOR_API_KEY` | Cursor CLI backend に渡す API key（Cursor CLI利用時のみ） | - |
 | `CURSOR_FORCE` | Cursor CLI に `--force` を渡す（明示的に `false` で無効化） | `true` |
 | `CURSOR_TRUST_WORKSPACE` | Cursor CLI に `--trust` を渡す（明示的に `false` で無効化） | `true` |
+| `XAI_API_KEY` | Grok CLI backend に渡す API key（Grok CLI利用時のみ。`grok login` 済みなら不要） | - |
 | `PERSISTENT_MODE` | 常駐プロセスモード | `true` |
 | `MAX_PROCESSES` | 同時実行プロセス数の上限 | `10` |
 | `IDLE_TIMEOUT_MS` | アイドルプロセスの自動終了時間 | `1800000` |
@@ -1072,7 +1101,7 @@ Even 側の provider 選択は `claude` / `codex` ラベルとして受け取る
 | 変数 | 説明 | デフォルト |
 |------|------|-----------|
 | `XANGI_EVEN_TERMINAL_TOKEN` | Even Terminal 互換 API 専用 token。未設定時は `XANGI_DEVICE_INBOX_TOKEN` → `XANGI_PET_INBOX_TOKEN` に fallback | (未設定) |
-| `XANGI_EVEN_TERMINAL_BACKEND` | Even Terminal 経由だけの backend default (`claude-code` / `codex` / `gemini` / `local-llm`) | `AGENT_BACKEND` |
+| `XANGI_EVEN_TERMINAL_BACKEND` | Even Terminal 経由だけの backend default (`claude-code` / `codex` / `cursor` / `grok` / `antigravity` / `local-llm`) | `AGENT_BACKEND` |
 | `XANGI_EVEN_TERMINAL_MODEL` | Even Terminal 経由だけの model default | `AGENT_MODEL` / backend側の既定 |
 | `XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE` | Even Terminal 経由だけの Local LLM mode default (`agent` / `lite` / `chat`) | `LOCAL_LLM_MODE` / `agent` |
 
@@ -1104,12 +1133,6 @@ GitHub App設定があれば、`gh` CLI実行時にインストールトーク�
 - トークン生成はtool-serverのHTTPエンドポイント（`/github-token`）経由で行われ、AIエージェントが取得できるのは短寿命のインストールトークン（1時間有効）のみです
 - トークン生成に失敗した場合、PATへのフォールバックは行わずエラーになります
 
-### Gemini CLI（`AGENT_BACKEND=gemini` 時）
-
-Gemini CLI backend は互換性維持と Enterprise / Google Cloud / paid API key 用の legacy backend です。Google AI Pro / Ultra / 無料の Gemini Code Assist for individuals 前提の Gemini CLI リクエストは 2026-06-18 に停止されるため、新規セットアップや通常運用の推奨 backend にはしません。
-
-既存環境で使う場合は `GEMINI.md` の自動読み込みや CLI 側の認証設定に依存します。xangi 側では主に `AGENT_BACKEND=gemini` と `AGENT_MODEL` を指定します。
-
 ### Cursor CLI（`AGENT_BACKEND=cursor` 時）
 
 Cursor CLI backend は `cursor-agent` コマンドを使用します。非対話実行は `cursor-agent -p ... --output-format json`、ストリーミングは `--output-format stream-json --stream-partial-output` です。
@@ -1120,7 +1143,23 @@ Cursor CLI backend は、非対話実行で workspace trust 待ちにならな�
 
 Cursor CLI backend は、Codex / Claude Code の `SKIP_PERMISSIONS=true` 既定と同じく、非対話運用で permission 待ちにならないよう、デフォルトで `--force` も渡します。通常の対話運用や信頼できない workspace では `CURSOR_FORCE=false` を明示してください。
 
-Antigravity CLI (`agy`) は、現時点では xangi backend として未対応です。公式に機械可読な JSON/stream 出力仕様が確認できるまで `AGENT_BACKEND=antigravity` は提供しません。
+### Grok CLI（`AGENT_BACKEND=grok` 時）
+
+Grok CLI backend は xAI の `grok` コマンドを使用します。非対話実行は `grok --no-auto-update -p ... --output-format json`、ストリーミングは `--output-format streaming-json` です。
+
+認証はローカルの `grok login`、または `XAI_API_KEY` に依存します。`XAI_API_KEY` は Grok CLI 子プロセスにのみ渡されます。
+
+`SKIP_PERMISSIONS=true` 既定時は、非対話運用で tool approval 待ちにならないよう `--always-approve` を渡します。個人用・信頼済み workspace 前提の設定です。
+
+### Antigravity CLI（`AGENT_BACKEND=antigravity` 時）
+
+Antigravity CLI backend は Google Antigravity CLI の `agy` コマンドを使用します。インストールは `curl -fsSL https://antigravity.google/cli/install.sh | bash`、認証は `agy` の初回起動フローに従います。
+
+非対話実行は `agy -p ...` です。`AGENT_MODEL` が設定されていれば `--model`、provider session があれば `--conversation` を渡します。
+
+`SKIP_PERMISSIONS=true` 既定時は、非対話運用で permission 待ちにならないよう `--dangerously-skip-permissions` を渡します。個人用・信頼済み workspace 前提の設定です。
+
+Antigravity CLI は現時点で安定した JSON/stream-json 出力を前提にしないため、xangi 側のストリーミング表示は最終応答を1回送るフォールバック動作です。将来 `agy` 側に機械可読な stream 出力が追加された場合は runner 側で逐次表示に拡張できます。
 
 ### Local LLM（`AGENT_BACKEND=local-llm` 時）
 
