@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { EnvValidator, validateChannelOverrides } from '../src/config-validate.js';
+import { installExtensionBackendFixture } from './helpers/extension-backend.js';
 
 describe('EnvValidator', () => {
   afterEach(() => {
@@ -62,15 +63,15 @@ describe('EnvValidator', () => {
   describe('enumOf', () => {
     it('大文字小文字を無視してマッチする', () => {
       const v = new EnvValidator({ LOCAL_LLM_MODE: 'AGENT' });
-      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent')).toBe('agent');
+      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'chat'] as const, 'agent')).toBe('agent');
       expect(v.issues).toHaveLength(0);
     });
 
     it('typo はデフォルトにフォールバックして issue を記録', () => {
       const v = new EnvValidator({ LOCAL_LLM_MODE: 'agnet' });
-      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent')).toBe('agent');
+      expect(v.enumOf('LOCAL_LLM_MODE', ['agent', 'chat'] as const, 'agent')).toBe('agent');
       expect(v.issues).toHaveLength(1);
-      expect(v.issues[0].message).toContain('agent / lite / chat');
+      expect(v.issues[0].message).toContain('agent / chat');
     });
   });
 
@@ -122,16 +123,29 @@ describe('EnvValidator', () => {
 });
 
 describe('validateChannelOverrides', () => {
-  it('有効な設定はそのまま通す', () => {
+  it('有効な設定はそのまま通す', async () => {
+    await installExtensionBackendFixture();
     const raw = JSON.stringify({
-      '123456789012345678': { backend: 'local-llm', model: 'gemma', localLlmMode: 'lite' },
+      '123456789012345678': {
+        backend: 'local-llm',
+        model: 'qwen3.8-27b',
+        localLlmMode: 'chat',
+        localLlmReasoningEffort: 'low',
+      },
       '234567890123456789': { backend: 'claude-code', effort: 'high' },
+      '345678901234567890': { backend: 'example-backend' },
     });
     const { overrides, issues } = validateChannelOverrides(raw);
     expect(issues).toHaveLength(0);
     expect(overrides).toEqual({
-      '123456789012345678': { backend: 'local-llm', model: 'gemma', localLlmMode: 'lite' },
+      '123456789012345678': {
+        backend: 'local-llm',
+        model: 'qwen3.8-27b',
+        localLlmMode: 'chat',
+        localLlmReasoningEffort: 'low',
+      },
       '234567890123456789': { backend: 'claude-code', effort: 'high' },
+      '345678901234567890': { backend: 'example-backend' },
     });
   });
 
@@ -157,15 +171,35 @@ describe('validateChannelOverrides', () => {
     expect(issues[0].channelId).toBe('111');
   });
 
-  it('effort / localLlmMode の不正値はエントリ除外', () => {
+  it('effort / Local LLM設定の不正値はエントリ除外', () => {
     const raw = JSON.stringify({
       '111': { backend: 'codex', effort: 'ultra' },
-      '222': { backend: 'local-llm', localLlmMode: 'turbo' },
+      '222': { backend: 'local-llm', localLlmMode: 'lite' },
+      '223': { backend: 'local-llm', localLlmReasoningEffort: 'instant' },
       '333': { backend: 'grok' },
     });
     const { overrides, issues } = validateChannelOverrides(raw);
     expect(Object.keys(overrides!)).toEqual(['333']);
-    expect(issues).toHaveLength(2);
+    expect(issues).toHaveLength(3);
+  });
+
+  it('backend が対応しない effort はエントリ除外', () => {
+    const raw = JSON.stringify({
+      '111': { backend: 'local-llm', effort: 'high' },
+      '222': { backend: 'antigravity', effort: 'max' },
+      '333': { backend: 'antigravity', effort: 'high' },
+      '444': { backend: 'grok', effort: 'max' },
+      '555': { backend: 'cursor', effort: 'low' },
+      '666': { backend: 'cursor', model: 'claude-opus-4-8', effort: 'high' },
+    });
+    const { overrides, issues } = validateChannelOverrides(raw);
+
+    expect(overrides).toEqual({
+      '333': { backend: 'antigravity', effort: 'high' },
+      '444': { backend: 'grok', effort: 'max' },
+      '666': { backend: 'cursor', model: 'claude-opus-4-8', effort: 'high' },
+    });
+    expect(issues).toHaveLength(3);
   });
 
   it('チャンネル ID が数値でない場合は警告するが読み込む', () => {
@@ -174,6 +208,20 @@ describe('validateChannelOverrides', () => {
     expect(overrides).toEqual({ 'not-a-channel': { backend: 'codex' } });
     expect(issues).toHaveLength(1);
     expect(issues[0].message).toContain('typo');
+  });
+
+  it('SlackとWebの正規チャンネルIDは警告しない', () => {
+    const raw = JSON.stringify({
+      C012ABCDEF: { backend: 'codex' },
+      'web-chat:session_123': { backend: 'claude-code' },
+    });
+    const { overrides, issues } = validateChannelOverrides(raw);
+
+    expect(overrides).toEqual({
+      C012ABCDEF: { backend: 'codex' },
+      'web-chat:session_123': { backend: 'claude-code' },
+    });
+    expect(issues).toEqual([]);
   });
 
   it('エントリがオブジェクトでない場合は除外', () => {

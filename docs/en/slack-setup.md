@@ -1,4 +1,4 @@
-[日本語](../slack-setup.md) | **English**
+[日本語](../slack-setup.md) | English
 
 # Slack App Setup Guide
 
@@ -18,6 +18,52 @@ Log in with your Slack account.
 4. Select your workspace
 5. Click **"Create App"**
 
+### Optional: Create from a Manifest
+
+If you select **"From an app manifest"** when creating the Slack App, you can configure Socket Mode / Event Subscriptions / OAuth scopes in one step. Paste the following manifest if you want to reduce manual setup.
+
+```yaml
+display_information:
+  name: xangi
+  description: AI CLI assistant for Slack
+  background_color: '#2f3136'
+features:
+  bot_user:
+    display_name: xangi
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - channels:read
+      - chat:write
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - reactions:read
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - reaction_added
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+```
+
+Even when using the manifest, you still need to create an App-Level Token (`connections:write`), install the app to the workspace, and copy the Bot User OAuth Token / App Token. Slash commands are not included in the manifest to avoid environment-specific Request URL behavior; add them manually in Step 6 only if needed.
+
 ## 3. Enable Socket Mode (Important)
 
 xangi operates in Socket Mode (no Webhook required).
@@ -36,12 +82,13 @@ xangi operates in Socket Mode (no Webhook required).
 2. Turn **"Enable Events"** ON
 3. Under **"Subscribe to bot events"**, add the following:
 
-| Event | Description | Purpose |
-|-------|-------------|---------|
-| `app_mention` | When the bot is mentioned | Required |
-| `message.im` | When a DM is received | For DM support |
-| `message.channels` | Messages in public channels | For responding without mentions |
-| `message.groups` | Messages in private channels | For responding without mentions |
+| Event              | Description                       | Purpose                         |
+| ------------------ | --------------------------------- | ------------------------------- |
+| `app_mention`      | When the bot is mentioned         | Required                        |
+| `reaction_added`   | When a deletion reaction is added | For reaction-based deletion     |
+| `message.im`       | When a DM is received             | For DM support                  |
+| `message.channels` | Messages in public channels       | For responding without mentions |
+| `message.groups`   | Messages in private channels      | For responding without mentions |
 
 > **Warning**: `message.channels` / `message.groups` are required if you use `SLACK_AUTO_REPLY_CHANNELS`
 
@@ -50,28 +97,38 @@ xangi operates in Socket Mode (no Webhook required).
 1. Click **"OAuth & Permissions"** in the left menu
 2. Under **"Scopes"** → **"Bot Token Scopes"**, add the following:
 
-| Scope | Description | Purpose |
-|-------|-------------|---------|
-| `app_mentions:read` | Read mentions | Required |
-| `chat:write` | Send messages | Required |
-| `files:read` | Read files | For file attachment support |
-| `reactions:write` | Add reactions (e.g. eyes emoji) | Required |
-| `im:history` | Read DM history | For DM support |
-| `im:read` | Read DMs | For DM support |
-| `im:write` | Send DMs | For DM support |
-| `channels:history` | Read public channel history | For responding without mentions |
-| `groups:history` | Read private channel history | For responding without mentions |
+| Scope               | Description                      | Purpose                         |
+| ------------------- | -------------------------------- | ------------------------------- |
+| `app_mentions:read` | Read mentions                    | Required                        |
+| `chat:write`        | Send messages                    | Required                        |
+| `files:read`        | Read files                       | For file attachment support     |
+| `files:write`       | Upload files                     | For sending generated files     |
+| `reactions:read`    | Read reaction events             | For reaction-based deletion     |
+| `reactions:write`   | Add reactions (e.g. eyes emoji)  | Required                        |
+| `im:history`        | Read DM history                  | For DM support                  |
+| `im:read`           | Read DMs                         | For DM support                  |
+| `im:write`          | Send DMs                         | For DM support                  |
+| `channels:read`     | Read public channel information  | For `xangi tool slack_channels`  |
+| `groups:read`       | Read private channel information | For `xangi tool slack_channels`  |
+| `channels:history`  | Read public channel history      | For responding without mentions |
+| `groups:history`    | Read private channel history     | For responding without mentions |
+
+After adding or changing scopes/events, reinstall the app from **"Install App"** in the left menu. Without reinstalling, `reaction_added` and `reactions:read` will not take effect.
 
 ## 6. Register Slash Commands (Optional)
 
 1. Click **"Slash Commands"** in the left menu
 2. Create the following commands:
 
-| Command | Description |
-|---------|-------------|
-| `/new` | Start a new session |
-| `/skills` | List available skills |
-| `/skill` | Run a skill (Usage Hint: `<skill-name> [args]`) |
+| Command     | Description                                                                       |
+| ----------- | --------------------------------------------------------------------------------- |
+| `/new`      | Start a new session                                                               |
+| `/delete`   | Delete the previous or specified bot message (Usage Hint: `[message-ts-or-link]`) |
+| `/skill`    | List or run a skill (Usage Hint: `[skill-name] [args]`)                           |
+| `/settings` | Show current settings                                                             |
+| `/models`   | List available models (Usage Hint: `[backend]`)                                   |
+| `/backend`  | Switch this channel's backend immediately (Usage Hint: `show\|set\|reset ...`)  |
+| `/restart`  | Request a graceful xangi restart                                                  |
 
 > **Note**: Request URL is not needed in Socket Mode.
 
@@ -82,26 +139,29 @@ xangi operates in Socket Mode (no Webhook required).
 3. Review permissions and click **"Allow"**
 4. **Copy the displayed Bot User OAuth Token (xoxb-...)**
 
-## 8. Set Environment Variables
+## 8. Set the tokens
 
 ```bash
-# Edit .env
-vim .env
+xangi settings
 ```
 
+Paste the Bot Token (xoxb-...) and App Token (xapp-...) into the Slack fields on the local settings page and save them.
+
+In a source checkout, non-secret advanced settings such as allowed user IDs can still be placed in `.env`:
+
 ```bash
-# Slack Bot Token (xoxb-...)
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-
-# Slack App Token (xapp-...) for Socket Mode
-SLACK_APP_TOKEN=xapp-your-app-token
-
 # Allowed user ID (Slack User ID)
 SLACK_ALLOWED_USER=U01234567
+
+# Optional: Post replies directly in specific channels instead of threads
+SLACK_REPLY_IN_CHANNELS=C01234567
+
+# Optional: Delete bot messages with `:wastebasket:` / `:x:` reactions (enabled by default)
+SLACK_REACTION_DELETE_ENABLED=true
+SLACK_DELETE_REACTIONS=wastebasket,x
 ```
 
-> **Warning**: If you're only using Slack, remove (or comment out) `DISCORD_TOKEN` from `.env`.
-> If `DISCORD_TOKEN` is set, Discord-side settings (`DISCORD_ALLOWED_USER`, etc.) will also be required.
+> When using only Slack, leave the Discord field unconfigured in `xangi settings`.
 
 ## 9. Verify It Works
 
@@ -110,17 +170,19 @@ SLACK_ALLOWED_USER=U01234567
 npm run build
 
 # Start with Docker
-docker compose up -d --build
+docker compose up xangi -d --build
 
 # Check logs
-docker logs -f xangi
+docker compose logs -f xangi
 ```
 
 Try the following in Slack:
+
 - Mention the bot: `@xangi Hello!`
 - Send a DM
 - `/new` command
-- `/skills` command
+- `/skill` command
+- Add a `:wastebasket:` or `:x:` reaction to a bot message to delete it
 
 ## How to Find IDs
 
@@ -132,10 +194,12 @@ Try the following in Slack:
 ### Channel ID
 
 **Method 1:** From the link
+
 1. Right-click the channel name → **"Copy link"**
 2. The channel ID is at the end of the URL: `https://xxx.slack.com/archives/C01234567` — `C01234567` is the ID
 
 **Method 2:** From channel info
+
 1. Open the channel → Click the channel name
 2. The **Channel ID** is displayed at the bottom
 
@@ -146,7 +210,7 @@ Try the following in Slack:
 1. Verify Socket Mode is enabled
 2. Verify `app_mention` and `message.im` are set in Event Subscriptions
 3. Verify the bot has been invited to the channel (`/invite @xangi`)
-4. Verify `ALLOWED_USER` is set to the correct Slack User ID
+4. Verify `SLACK_ALLOWED_USER` is set to the correct Slack User ID
 
 ### Slash Commands Don't Work
 
@@ -155,7 +219,7 @@ Try the following in Slack:
 
 ### "Slack tokens not configured" Error
 
-Verify that `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are set in `.env`.
+Open `xangi settings` and confirm that both Slack fields are marked as configured.
 
 ### Bot Doesn't Respond in DMs
 
@@ -172,9 +236,9 @@ To use the bot in a channel, you need to invite it:
 
 ## Security Notes
 
-- **Never commit tokens to Git** (`.env` is already in `.gitignore`)
+- **Never paste tokens into Git or an AI conversation**
 - **Never expose tokens publicly** (regenerate in Slack App settings if leaked)
-- `ALLOWED_USER` restricts usage to a single user (in compliance with Claude Code Terms of Service)
+- `SLACK_ALLOWED_USER` restricts usage to a single user (in compliance with Claude Code Terms of Service)
 
 ## References
 

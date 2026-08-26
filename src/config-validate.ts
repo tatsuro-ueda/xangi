@@ -9,6 +9,15 @@
  * - 外部依存なし（zod 等は追加しない）
  */
 
+import type { AgentBackend, EffortLevel } from './config.js';
+import { LOCAL_LLM_REASONING_EFFORTS } from './local-llm/reasoning-effort.js';
+import { listExtensionAgentBackends } from './extensions.js';
+import {
+  getSupportedEffortLevels,
+  requiresExplicitModelForEffort,
+  supportsEffort,
+} from './backend-effort.js';
+
 export interface ConfigIssue {
   /** 環境変数名 */
   key: string;
@@ -140,16 +149,34 @@ export class EnvValidator {
   }
 }
 
-const VALID_BACKENDS = [
+const BUILTIN_BACKENDS = [
   'claude-code',
   'codex',
   'cursor',
   'grok',
   'antigravity',
+  'github-copilot',
   'local-llm',
 ] as const;
+
+function validBackends(): string[] {
+  return [
+    ...BUILTIN_BACKENDS,
+    ...listExtensionAgentBackends()
+      .map((item) => item.id)
+      .filter((id) => !(BUILTIN_BACKENDS as readonly string[]).includes(id)),
+  ];
+}
 const VALID_EFFORTS = ['low', 'medium', 'high', 'max'] as const;
-const VALID_LLM_MODES = ['agent', 'lite', 'chat'] as const;
+const VALID_LLM_MODES = ['agent', 'chat'] as const;
+
+function isRecognizedChannelId(channelId: string): boolean {
+  return (
+    /^-?\d+$/.test(channelId) ||
+    /^[CDG][A-Z0-9]+$/.test(channelId) ||
+    /^web-chat:[A-Za-z0-9_-]+$/.test(channelId)
+  );
+}
 
 export interface ChannelOverrideIssue {
   channelId: string;
@@ -164,10 +191,17 @@ export interface ChannelOverrideIssue {
 export function validateChannelOverrides(raw: string): {
   overrides: Record<
     string,
-    { backend?: string; model?: string; effort?: string; localLlmMode?: string }
+    {
+      backend?: string;
+      model?: string;
+      effort?: string;
+      localLlmMode?: string;
+      localLlmReasoningEffort?: string;
+    }
   > | null;
   issues: ChannelOverrideIssue[];
 } {
+  const validBackendIds = validBackends();
   const issues: ChannelOverrideIssue[] = [];
   let parsed: unknown;
   try {
@@ -189,14 +223,20 @@ export function validateChannelOverrides(raw: string): {
 
   const result: Record<
     string,
-    { backend?: string; model?: string; effort?: string; localLlmMode?: string }
+    {
+      backend?: string;
+      model?: string;
+      effort?: string;
+      localLlmMode?: string;
+      localLlmReasoningEffort?: string;
+    }
   > = {};
 
   for (const [channelId, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (!/^\d+$/.test(channelId)) {
+    if (!isRecognizedChannelId(channelId)) {
       issues.push({
         channelId,
-        message: `チャンネル ID が数値ではありません（typo の可能性）。このエントリは読み込みますが確認してください`,
+        message: `認識できないチャンネル ID 形式です（typo の可能性）。このエントリは読み込みますが確認してください`,
       });
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -204,19 +244,22 @@ export function validateChannelOverrides(raw: string): {
       continue;
     }
     const o = value as Record<string, unknown>;
-    const entry: { backend?: string; model?: string; effort?: string; localLlmMode?: string } = {};
+    const entry: {
+      backend?: string;
+      model?: string;
+      effort?: string;
+      localLlmMode?: string;
+      localLlmReasoningEffort?: string;
+    } = {};
     let valid = true;
 
     if (o.backend !== undefined) {
-      if (
-        typeof o.backend === 'string' &&
-        (VALID_BACKENDS as readonly string[]).includes(o.backend)
-      ) {
+      if (typeof o.backend === 'string' && validBackendIds.includes(o.backend)) {
         entry.backend = o.backend;
       } else {
         issues.push({
           channelId,
-          message: `backend '${String(o.backend)}' は不正です (${VALID_BACKENDS.join(' / ')})。このエントリは無視します`,
+          message: `backend '${String(o.backend)}' は不正です (${validBackendIds.join(' / ')})。このエントリは無視します`,
         });
         valid = false;
       }
@@ -253,6 +296,51 @@ export function validateChannelOverrides(raw: string): {
         });
         valid = false;
       }
+    }
+    if (o.localLlmReasoningEffort !== undefined) {
+      if (
+        typeof o.localLlmReasoningEffort === 'string' &&
+        (LOCAL_LLM_REASONING_EFFORTS as readonly string[]).includes(o.localLlmReasoningEffort)
+      ) {
+        entry.localLlmReasoningEffort = o.localLlmReasoningEffort;
+      } else {
+        issues.push({
+          channelId,
+          message: `localLlmReasoningEffort '${String(o.localLlmReasoningEffort)}' は不正です (${LOCAL_LLM_REASONING_EFFORTS.join(' / ')})。このエントリは無視します`,
+        });
+        valid = false;
+      }
+    }
+
+    if (
+      valid &&
+      entry.backend &&
+      entry.effort &&
+      !supportsEffort(entry.backend as AgentBackend, entry.effort as EffortLevel)
+    ) {
+      const supported = getSupportedEffortLevels(entry.backend as AgentBackend);
+      issues.push({
+        channelId,
+        message:
+          supported.length > 0
+            ? `backend '${entry.backend}' は effort '${entry.effort}' に対応していません（対応: ${supported.join(' / ')}）。このエントリは無視します`
+            : `backend '${entry.backend}' は effort に対応していません。このエントリは無視します`,
+      });
+      valid = false;
+    }
+
+    if (
+      valid &&
+      entry.backend &&
+      entry.effort &&
+      requiresExplicitModelForEffort(entry.backend as AgentBackend) &&
+      !entry.model
+    ) {
+      issues.push({
+        channelId,
+        message: `backend '${entry.backend}' で effort を指定するには model の明示指定が必要です。このエントリは無視します`,
+      });
+      valid = false;
     }
 
     if (valid) {

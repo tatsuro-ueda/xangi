@@ -1,7 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { describe, expect, it, vi } from 'vitest';
 import { BackendResolver } from '../src/backend-resolver.js';
 import type { Config } from '../src/config.js';
 import { DynamicRunnerManager } from '../src/dynamic-runner.js';
+import {
+  createSession,
+  getSessionEntry,
+  initSessions,
+  setProviderSessionId,
+} from '../src/sessions.js';
 
 function makeConfig(platform: Config['agent']['platform']): Config {
   return {
@@ -19,6 +28,34 @@ function makeConfig(platform: Config['agent']['platform']): Config {
 }
 
 describe('DynamicRunnerManager platform routing', () => {
+  it('creates a dedicated runner keyed by a non-default canonical workdir', () => {
+    const defaultWorkdir = mkdtempSync(join(tmpdir(), 'dynamic-runner-default-'));
+    const alternateWorkdir = mkdtempSync(join(tmpdir(), 'dynamic-runner-alternate-'));
+    try {
+      const config = makeConfig('discord');
+      config.agent.config.workdir = defaultWorkdir;
+      const resolver = new BackendResolver(config);
+      const manager = new DynamicRunnerManager(config, resolver);
+      const resolved = resolver.resolve('channel-1');
+
+      const runner = (
+        manager as unknown as {
+          getRunner(
+            channelId: string,
+            resolved: typeof resolved,
+            platform: Config['agent']['platform'],
+            workdir: string
+          ): unknown;
+        }
+      ).getRunner('channel-1', resolved, 'discord', alternateWorkdir);
+
+      expect((runner as { workdir?: string }).workdir).toBe(alternateWorkdir);
+    } finally {
+      rmSync(defaultWorkdir, { recursive: true, force: true });
+      rmSync(alternateWorkdir, { recursive: true, force: true });
+    }
+  });
+
   it('creates a platform-specific runner when a Web/Even turn uses a Discord default runner', () => {
     const config = makeConfig('discord');
     const manager = new DynamicRunnerManager(config, new BackendResolver(config));
@@ -73,6 +110,317 @@ describe('DynamicRunnerManager platform routing', () => {
       } else {
         process.env.CHANNEL_OVERRIDES = originalOverrides;
       }
+    }
+  });
+
+  it('uses settingsChannelId for backend resolution while keeping channelId as the run key', async () => {
+    const config = makeConfig('discord');
+    const resolved = { backend: 'local-llm' as const, model: 'test' };
+    const resolver = {
+      resolve: vi.fn().mockReturnValue(resolved),
+      getDefault: vi.fn().mockReturnValue(resolved),
+    } as unknown as BackendResolver;
+    const manager = new DynamicRunnerManager(config, resolver);
+    const run = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+
+    (
+      manager as unknown as {
+        defaultRunner: { run: typeof run };
+      }
+    ).defaultRunner = { run };
+
+    await manager.run('prompt', {
+      channelId: 'thread-456',
+      settingsChannelId: 'parent-123',
+    });
+
+    expect(resolver.resolve).toHaveBeenCalledWith('parent-123', undefined);
+    expect(run).toHaveBeenCalledWith(
+      'prompt',
+      expect.objectContaining({
+        channelId: 'thread-456',
+        settingsChannelId: 'parent-123',
+      })
+    );
+  });
+
+  it('runs UserPromptSubmit before both run paths and passes enriched prompt to every backend', async () => {
+    const workdir = mkdtempSync(join(tmpdir(), 'dynamic-runner-hook-'));
+    try {
+      mkdirSync(join(workdir, 'hooks'));
+      const hookScript = `
+        let raw = '';
+        process.stdin.on('data', (chunk) => (raw += chunk));
+        process.stdin.on('end', () => {
+          const input = JSON.parse(raw);
+          process.stdout.write(JSON.stringify({
+            hookSpecificOutput: { additionalContext: 'prefetched:' + input.prompt }
+          }));
+        });
+      `;
+      writeFileSync(
+        join(workdir, 'hooks', 'hooks.json'),
+        JSON.stringify({
+          hooks: {
+            UserPromptSubmit: [
+              { id: 'prefetch', exec: { file: process.execPath, args: ['-e', hookScript] } },
+            ],
+          },
+        })
+      );
+      const config = makeConfig('discord');
+      config.agent.config.workdir = workdir;
+      const resolved = { backend: 'local-llm' as const, model: 'test' };
+      const resolver = {
+        resolve: vi.fn().mockReturnValue(resolved),
+        getDefault: vi.fn().mockReturnValue(resolved),
+      } as unknown as BackendResolver;
+      const manager = new DynamicRunnerManager(config, resolver);
+      const run = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+      const runStream = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+      (
+        manager as unknown as {
+          defaultRunner: { run: typeof run; runStream: typeof runStream };
+        }
+      ).defaultRunner = { run, runStream };
+
+      const options = {
+        channelId: 'thread-456',
+        appSessionId: 'app-session-1',
+        platform: 'discord' as const,
+        userText: 'raw user query',
+      };
+      await manager.run('composed prompt', options);
+      await manager.runStream('stream prompt', {}, options);
+
+      expect(run.mock.calls[0]?.[0]).toContain('prefetched:raw user query');
+      expect(runStream.mock.calls[0]?.[0]).toContain('prefetched:raw user query');
+      expect(run.mock.calls[0]?.[0]).toContain('[USER PROMPT HOOK CONTEXT: prefetch]');
+
+      writeFileSync(
+        join(workdir, 'hooks', 'hooks.json'),
+        JSON.stringify({ hooks: { UserPromptSubmit: [] } })
+      );
+      await manager.run('prompt after hook removal', options);
+      expect(run.mock.calls[1]?.[0]).toBe('prompt after hook removal');
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not run UserPromptSubmit without unexpanded userText', async () => {
+    const config = makeConfig('discord');
+    const resolved = { backend: 'local-llm' as const, model: 'test' };
+    const resolver = {
+      resolve: vi.fn().mockReturnValue(resolved),
+      getDefault: vi.fn().mockReturnValue(resolved),
+    } as unknown as BackendResolver;
+    const manager = new DynamicRunnerManager(config, resolver);
+    const run = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+    (manager as unknown as { defaultRunner: { run: typeof run } }).defaultRunner = { run };
+
+    await manager.run('prompt without raw input');
+
+    expect(run).toHaveBeenCalledWith('prompt without raw input', undefined);
+  });
+
+  it('passes a Project default backend, model, and effort to backend resolution', async () => {
+    const config = makeConfig('web');
+    const resolved = { backend: 'local-llm' as const, model: 'test' };
+    const resolver = {
+      resolve: vi.fn().mockReturnValue(resolved),
+      getDefault: vi.fn().mockReturnValue({ backend: 'local-llm', model: 'test' }),
+    } as unknown as BackendResolver;
+    const manager = new DynamicRunnerManager(config, resolver);
+    const run = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+
+    (manager as unknown as { defaultRunner: { run: typeof run } }).defaultRunner = { run };
+
+    await manager.run('prompt', {
+      channelId: 'web-chat:session-1',
+      defaultBackend: 'codex',
+      defaultModel: 'gpt-5.6-sol',
+      defaultEffort: 'high',
+    });
+
+    expect(resolver.resolve).toHaveBeenCalledWith('web-chat:session-1', {
+      backend: 'codex',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    });
+  });
+
+  it('passes the resolved effort to the selected runner', async () => {
+    const config = makeConfig('discord');
+    const resolved = { backend: 'codex' as const, model: 'gpt-5.6-sol', effort: 'max' as const };
+    const resolver = {
+      resolve: vi.fn().mockReturnValue(resolved),
+      getDefault: vi.fn().mockReturnValue(resolved),
+    } as unknown as BackendResolver;
+    const manager = new DynamicRunnerManager(config, resolver);
+    const run = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+
+    (
+      manager as unknown as {
+        defaultRunner: { run: typeof run };
+      }
+    ).defaultRunner = { run };
+
+    await manager.run('prompt');
+
+    expect(run).toHaveBeenCalledWith('prompt', { effort: 'max' });
+  });
+
+  it('passes the resolved Local LLM reasoning effort to the selected runner', async () => {
+    const config = makeConfig('discord');
+    const resolved = {
+      backend: 'local-llm' as const,
+      model: 'qwen3.8-27b',
+      localLlmReasoningEffort: 'low' as const,
+    };
+    const resolver = {
+      resolve: vi.fn().mockReturnValue(resolved),
+      getDefault: vi.fn().mockReturnValue(resolved),
+    } as unknown as BackendResolver;
+    const manager = new DynamicRunnerManager(config, resolver);
+    const run = vi.fn().mockResolvedValue({ result: 'ok', sessionId: 'session-1' });
+
+    (
+      manager as unknown as {
+        defaultRunner: { run: typeof run };
+      }
+    ).defaultRunner = { run };
+
+    await manager.run('prompt');
+
+    expect(run).toHaveBeenCalledWith('prompt', { localLlmReasoningEffort: 'low' });
+  });
+
+  it('delegates hasRunner to a channel-specific runner', () => {
+    const config = makeConfig('discord');
+    const manager = new DynamicRunnerManager(config, new BackendResolver(config));
+    const hasRunner = vi.fn().mockReturnValue(false);
+
+    (
+      manager as unknown as {
+        channelRunners: Map<string, { runner: { hasRunner: typeof hasRunner }; key: string }>;
+      }
+    ).channelRunners.set('web-chat:session-1', {
+      runner: { hasRunner },
+      key: 'codex:test:web:',
+    });
+
+    expect(manager.hasRunner('web-chat:session-1')).toBe(false);
+    expect(hasRunner).toHaveBeenCalledWith('web-chat:session-1');
+
+    hasRunner.mockReturnValue(true);
+    expect(manager.hasRunner('web-chat:session-1')).toBe(true);
+  });
+
+  it('records stateless provider metadata returned by a backend', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'dynamic-runner-stateless-'));
+    try {
+      initSessions(tempDir);
+      const appSessionId = createSession('discord-channel', { platform: 'discord' });
+      const config = makeConfig('discord');
+      const manager = new DynamicRunnerManager(config, new BackendResolver(config));
+      const run = vi.fn().mockResolvedValue({
+        result: 'result',
+        sessionId: 'search:discord-channel',
+        sessionMode: 'stateless' as const,
+      });
+      (
+        manager as unknown as {
+          defaultRunner: { run: typeof run };
+        }
+      ).defaultRunner = { run };
+
+      await manager.run('prompt', {
+        channelId: 'discord-channel',
+        appSessionId,
+      });
+
+      expect(getSessionEntry(appSessionId)?.agent?.sessionMode).toBe('stateless');
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('records stateless mode before a backend request can fail', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'dynamic-runner-stateless-error-'));
+    try {
+      initSessions(tempDir);
+      const appSessionId = createSession('discord-channel', { platform: 'discord' });
+      const config = makeConfig('discord');
+      const resolved = {
+        backend: 'local-llm' as const,
+        model: 'test',
+        sessionMode: 'stateless' as const,
+      };
+      const resolver = {
+        resolve: vi.fn().mockReturnValue(resolved),
+        getDefault: vi.fn().mockReturnValue(resolved),
+      } as unknown as BackendResolver;
+      const manager = new DynamicRunnerManager(config, resolver);
+      const run = vi.fn().mockRejectedValue(new Error('search failed'));
+      (
+        manager as unknown as {
+          defaultRunner: { run: typeof run };
+        }
+      ).defaultRunner = { run };
+
+      await expect(
+        manager.run('prompt', {
+          channelId: 'discord-channel',
+          appSessionId,
+        })
+      ).rejects.toThrow('search failed');
+
+      expect(getSessionEntry(appSessionId)?.agent?.sessionMode).toBe('stateless');
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops a provider session when the resolved model or effort changed', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'dynamic-runner-session-'));
+    try {
+      initSessions(tempDir);
+      const appSessionId = createSession('discord-channel', { platform: 'discord' });
+      setProviderSessionId(appSessionId, 'provider-old', 'codex', 'gpt-old', 'low');
+
+      const config = {
+        ...makeConfig('discord'),
+        agent: {
+          backend: 'codex',
+          config: { model: 'gpt-new' },
+          platform: 'discord',
+        },
+      } as Config;
+      const manager = new DynamicRunnerManager(config, new BackendResolver(config));
+      const result = (
+        manager as unknown as {
+          dropMismatchedProviderSession(
+            options: {
+              channelId: string;
+              appSessionId: string;
+              sessionId: string;
+            },
+            resolved: { backend: 'codex'; model: string; effort: 'high' }
+          ): { sessionId?: string };
+        }
+      ).dropMismatchedProviderSession(
+        {
+          channelId: 'discord-channel',
+          appSessionId,
+          sessionId: 'provider-old',
+        },
+        { backend: 'codex', model: 'gpt-new', effort: 'high' }
+      );
+
+      expect(result.sessionId).toBeUndefined();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });

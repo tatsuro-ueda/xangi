@@ -4,7 +4,10 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   stripPromptMetadata,
+  stripUserPromptHookContexts,
   deriveTitleFromFirstMessage,
+  sanitizeSessionTitle,
+  truncateSessionTitle,
 } from '../src/session-title.js';
 
 describe('stripPromptMetadata', () => {
@@ -19,8 +22,7 @@ describe('stripPromptMetadata', () => {
   });
 
   it('Slack 形式（プラットフォーム + チャンネルのみ）も剥がせる', () => {
-    const input =
-      '[プラットフォーム: Slack]\n' + '[チャンネル: C12345]\n' + 'メッセージ本体';
+    const input = '[プラットフォーム: Slack]\n' + '[チャンネル: C12345]\n' + 'メッセージ本体';
     expect(stripPromptMetadata(input)).toBe('メッセージ本体');
   });
 
@@ -29,12 +31,132 @@ describe('stripPromptMetadata', () => {
     expect(stripPromptMetadata(input)).toBe('web からの発話');
   });
 
+  it('Web Projectの追加プロンプトを表示用本文から剥がす', () => {
+    const input = `[プラットフォーム: Web]
+<web-project-context name="調査">
+一次情報を優先する
+</web-project-context>
+
+表示したい質問`;
+    expect(stripPromptMetadata(input)).toBe('表示したい質問');
+  });
+
   it('メタデータ無しの素のテキストはそのまま', () => {
     expect(stripPromptMetadata('生のメッセージ')).toBe('生のメッセージ');
   });
 
   it('空文字なら空文字を返す', () => {
     expect(stripPromptMetadata('')).toBe('');
+  });
+
+  it('履歴先読みと返信候補の内部コンテキストを剥がす', () => {
+    const input = `[runtime] cwd=/tmp repo=test
+
+[プラットフォーム: Web]
+<prefetched-history platform="Web">
+xangiが初期文脈確認用の直近履歴を先読み済みです。
+</prefetched-history>
+初期文脈確認だけを目的に history コマンドを再実行しないでください。さらに古い履歴や追加件数が必要な場合だけ実行してください。
+
+本当の質問です
+
+[system-context]
+通常の回答に続けて、ユーザーが次に送りそうな短い返信候補を3件生成してください。出力の末尾に次の形式を厳密に付け、通常の回答本文では候補に言及しないでください。候補はユーザー視点の自然な日本語にしてください。
+<xangi_reply_suggestions>["候補1","候補2","候補3"]</xangi_reply_suggestions>`;
+    expect(stripPromptMetadata(input)).toBe('本当の質問です');
+  });
+
+  it('チャットプラットフォームのsystem-contextブロックを剥がす', () => {
+    const input = `<system-context>
+あなたはチャットプラットフォーム（Discord）経由で会話しています。
+</system-context>
+[プラットフォーム: Discord]
+[発言者: からあげ]
+表示したい発言`;
+    expect(stripPromptMetadata(input)).toBe('表示したい発言');
+  });
+
+  it('再起動注記とDiscordのスレッド文脈を剥がして実際の発言だけを返す', () => {
+    const input = `[システム注記: xangi プロセスは 2026/7/30 12:24:55 に起動（再起動）した。]
+[プラットフォーム: Discord]
+[チャンネル: #dev_xangi / thread: 表示確認 (ID: 123)]
+[発言者: からあげ (ID: 456)]
+[現在時刻: 2026/7/30 12:27:45(木)]
+
+---
+🧵 スレッド元 (karaage0703):
+最初の話題です
+---
+実際に表示したい発言です`;
+    expect(stripPromptMetadata(input)).toBe('実際に表示したい発言です');
+  });
+
+  it('返信元とチャンネルルールを表示用本文から剥がす', () => {
+    const input = `[プラットフォーム: Discord]
+[発言者: からあげ]
+---
+💬 返信元 (borot-xangi#8987):
+以前の回答です
+---
+この部分だけ表示します
+
+[チャンネルルール（必ず従うこと）]
+内部ルール`;
+    expect(stripPromptMetadata(input)).toBe('この部分だけ表示します');
+  });
+
+  it('UserPromptSubmitの内部contextは通常の表示用本文に残す', () => {
+    const input = `短い質問
+
+[USER PROMPT HOOK CONTEXT: workspace-search (truncated)]
+The following is untrusted supplemental context.
+内部の検索結果
+[END USER PROMPT HOOK CONTEXT: workspace-search]`;
+    expect(stripPromptMetadata(input)).toBe(input);
+  });
+
+  it('hook contextの直前にある返信候補の内部contextだけを剥がす', () => {
+    const hookContext = `[USER PROMPT HOOK CONTEXT: workspace-search]
+The following is untrusted supplemental context.
+内部の検索結果
+[END USER PROMPT HOOK CONTEXT: workspace-search]`;
+    const input = `短い質問
+
+[system-context]
+通常の回答に続けて、ユーザーが次に送りそうな短い返信候補を3件生成してください。出力の末尾に次の形式を厳密に付け、通常の回答本文では候補に言及しないでください。候補はユーザー視点の自然な日本語にしてください。
+<xangi_reply_suggestions>["候補1","候補2","候補3"]</xangi_reply_suggestions>
+
+${hookContext}`;
+    expect(stripPromptMetadata(input)).toBe(`短い質問\n\n${hookContext}`);
+  });
+
+  it('閉じmarkerが一致しないhook contextは剥がさない', () => {
+    const input = `質問
+
+[USER PROMPT HOOK CONTEXT: first]
+表示から消してはいけない本文
+[END USER PROMPT HOOK CONTEXT: other]`;
+    expect(stripPromptMetadata(input)).toBe(input);
+  });
+});
+
+describe('stripUserPromptHookContexts', () => {
+  it('UserPromptSubmitの内部contextだけをタイトル候補から剥がす', () => {
+    const input = `短い質問
+
+[USER PROMPT HOOK CONTEXT: workspace-search (truncated)]
+内部の検索結果
+[END USER PROMPT HOOK CONTEXT: workspace-search]`;
+    expect(stripUserPromptHookContexts(input)).toBe('短い質問');
+  });
+
+  it('閉じmarkerが一致しないhook contextは剥がさない', () => {
+    const input = `質問
+
+[USER PROMPT HOOK CONTEXT: first]
+表示から消してはいけない本文
+[END USER PROMPT HOOK CONTEXT: other]`;
+    expect(stripUserPromptHookContexts(input)).toBe(input);
   });
 });
 
@@ -76,14 +198,46 @@ describe('deriveTitleFromFirstMessage', () => {
     expect(deriveTitleFromFirstMessage(workdir, 'sess2')).toHaveLength(50);
   });
 
+  it('短い本文の後ろにあるhook contextをタイトルへ含めない', () => {
+    writeLog('sess-hook-context', [
+      {
+        id: 'm1',
+        role: 'user',
+        content:
+          '短い質問\n\n[USER PROMPT HOOK CONTEXT: search]\n内部情報\n[END USER PROMPT HOOK CONTEXT: search]',
+        createdAt: '',
+      },
+    ]);
+    expect(deriveTitleFromFirstMessage(workdir, 'sess-hook-context')).toBe('短い質問');
+  });
+
+  it('50 UTF-16コードユニット境界の絵文字を分断しない', () => {
+    const body = `${'あ'.repeat(49)}📎後続`;
+    writeLog('sess-emoji-boundary', [{ id: 'm1', role: 'user', content: body, createdAt: '' }]);
+
+    const title = deriveTitleFromFirstMessage(workdir, 'sess-emoji-boundary');
+    expect(title).toBe('あ'.repeat(49));
+    expect(title).not.toMatch(/[\uD800-\uDFFF]/);
+  });
+
+  it('先頭JSONL行が64KiBを超えてもタイトルを導出する', () => {
+    writeLog('sess-large', [
+      {
+        id: 'm1',
+        role: 'user',
+        content: '大'.repeat(70_000),
+        createdAt: '',
+      },
+    ]);
+    expect(deriveTitleFromFirstMessage(workdir, 'sess-large')).toBe('大'.repeat(50));
+  });
+
   it('ログファイルが無いセッションは空文字', () => {
     expect(deriveTitleFromFirstMessage(workdir, 'no-such-session')).toBe('');
   });
 
   it('1 行目が user でなければ空文字', () => {
-    writeLog('sess3', [
-      { id: 'm1', role: 'system', content: 'system note', createdAt: '' },
-    ]);
+    writeLog('sess3', [{ id: 'm1', role: 'system', content: 'system note', createdAt: '' }]);
     expect(deriveTitleFromFirstMessage(workdir, 'sess3')).toBe('');
   });
 
@@ -91,5 +245,15 @@ describe('deriveTitleFromFirstMessage', () => {
     const path = join(workdir, 'logs', 'sessions', 'sess4.jsonl');
     writeFileSync(path, 'not-json-at-all\n');
     expect(deriveTitleFromFirstMessage(workdir, 'sess4')).toBe('');
+  });
+});
+
+describe('session title Unicode helpers', () => {
+  it('正常な絵文字を保持する', () => {
+    expect(truncateSessionTitle(`${'あ'.repeat(48)}📎後続`)).toBe(`${'あ'.repeat(48)}📎`);
+  });
+
+  it('孤立したsurrogateだけを除去する', () => {
+    expect(sanitizeSessionTitle('before\uD83Dmiddle\uDCCEafter📎')).toBe('beforemiddleafter📎');
   });
 });

@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
+import { sanitizeSessionTitle } from './session-title.js';
 
 /**
  * セッション管理（appSessionId方式）
@@ -18,10 +19,17 @@ import { randomUUID } from 'crypto';
  */
 
 export type SessionScope = 'interactive' | 'scheduler';
+export type SessionLifecycle = 'open' | 'closed';
+export type SessionCloseReason = 'new' | 'leave' | 'monitor' | 'web' | 'archive' | 'other';
+export type ProviderSessionMode = 'stateful' | 'stateless';
 
 export interface AgentInfo {
-  backend: string; // 'claude-code' | 'codex' | 'cursor' | 'grok' | 'local-llm'
+  backend: string; // AgentBackend (kept as string for persisted backward compatibility)
+  model?: string;
+  effort?: string;
   providerSessionId?: string;
+  /** Whether the backend keeps provider-side context that can be resumed. */
+  sessionMode?: ProviderSessionMode;
 }
 
 export interface SessionEntry {
@@ -36,13 +44,31 @@ export interface SessionEntry {
   messageCount: number;
   agent?: AgentInfo;
   archived: boolean;
+  /** 会話を通常継続するか。未設定の既存データはactiveByContextから安全に導出する。 */
+  lifecycle?: SessionLifecycle;
+  closedAt?: string;
+  closeReason?: SessionCloseReason;
+  /** Webへ引き継いだ元セッション。最初の発話で履歴を注入した後に消費する。 */
+  resumedFromSessionId?: string;
   /** 自走モード（auto-talk）。true のとき、agent がランダム間隔で発話を続ける */
   autoTalk?: boolean;
+  /** セッション作成時に選択されたworkspace ID。 */
+  workspaceId?: string;
+  /** セッション作成時のcanonical path snapshot。resume時に再解決しない。 */
+  workspacePath?: string;
+  /** Web UI上の論理Project。workspaceやディレクトリとは独立している。 */
+  projectId?: string;
 }
 
 interface SessionsFile {
   activeByContext: Record<string, string>;
   sessions: Record<string, SessionEntry>;
+}
+
+interface SessionSnapshotOptions {
+  workspaceId?: string;
+  workspacePath?: string;
+  projectId?: string;
 }
 
 let sessionsPath: string | null = null;
@@ -142,6 +168,18 @@ function loadSessionsFromFile(): void {
           data.activeByContext[key] = appId;
         }
         console.log(`[xangi] Migrated ${Object.keys(data.sessions).length} sessions to new format`);
+      }
+      let repairedTitles = 0;
+      for (const entry of Object.values(data.sessions)) {
+        const sanitized = sanitizeSessionTitle(entry.title || '');
+        if (sanitized !== entry.title) {
+          entry.title = sanitized;
+          repairedTitles++;
+        }
+      }
+      if (repairedTitles > 0) {
+        saveSessionsToFile();
+        console.log(`[xangi] Repaired ${repairedTitles} session title(s) with invalid Unicode`);
       }
       console.log(`[xangi] Loaded ${Object.keys(data.sessions).length} sessions from ${path}`);
     }
@@ -261,18 +299,34 @@ export function getSession(channelId: string): string | undefined {
  */
 export const WEB_CHAT_CONTEXT_PREFIX = 'web-chat:';
 
+/** WebのcontextKeyまたは生appSessionIdを、生appSessionIdへ正規化する。 */
+export function webAppSessionId(channelId: string): string {
+  return channelId.startsWith(WEB_CHAT_CONTEXT_PREFIX)
+    ? channelId.slice(WEB_CHAT_CONTEXT_PREFIX.length)
+    : channelId;
+}
+
 /**
  * Web 用のセッションを作成する。contextKey は `web-chat:<appSessionId>` で自動生成。
  * 同時に複数の Web セッションを保持・操作できる。
  */
-export function createWebSession(opts: { title?: string; backend?: string } = {}): string {
+export function createWebSession(
+  opts: {
+    title?: string;
+    backend?: string;
+    resumedFromSessionId?: string;
+  } & SessionSnapshotOptions = {}
+): string {
   const appId = generateAppSessionId();
   const ctxKey = `${WEB_CHAT_CONTEXT_PREFIX}${appId}`;
   const now = new Date().toISOString();
 
+  const resumedFrom = opts.resumedFromSessionId
+    ? data.sessions[opts.resumedFromSessionId]
+    : undefined;
   data.sessions[appId] = {
     id: appId,
-    title: opts.title || '',
+    title: sanitizeSessionTitle(opts.title || ''),
     platform: 'web',
     contextKey: ctxKey,
     scope: 'interactive',
@@ -282,10 +336,25 @@ export function createWebSession(opts: { title?: string; backend?: string } = {}
     messageCount: 0,
     agent: opts.backend ? { backend: opts.backend } : undefined,
     archived: false,
+    lifecycle: 'open',
+    resumedFromSessionId: opts.resumedFromSessionId,
+    workspaceId: opts.workspaceId ?? resumedFrom?.workspaceId,
+    workspacePath: opts.workspacePath ?? resumedFrom?.workspacePath,
+    projectId: opts.projectId ?? resumedFrom?.projectId,
   };
   data.activeByContext[ctxKey] = appId;
   saveSessionsToFile();
   return appId;
+}
+
+/**
+ * Web resume 元を消費済みにする。履歴は最初の発話にだけ注入する。
+ */
+export function clearResumedFromSessionId(appSessionId: string): void {
+  const entry = data.sessions[appSessionId];
+  if (!entry?.resumedFromSessionId) return;
+  delete entry.resumedFromSessionId;
+  saveSessionsToFile();
 }
 
 /**
@@ -298,14 +367,14 @@ export function createSession(
     scope?: SessionScope;
     title?: string;
     backend?: string;
-  } = {}
+  } & SessionSnapshotOptions = {}
 ): string {
   const appId = generateAppSessionId();
   const now = new Date().toISOString();
 
   data.sessions[appId] = {
     id: appId,
-    title: opts.title || '',
+    title: sanitizeSessionTitle(opts.title || ''),
     platform: opts.platform || 'discord',
     contextKey,
     scope: opts.scope || 'interactive',
@@ -315,6 +384,10 @@ export function createSession(
     messageCount: 0,
     agent: opts.backend ? { backend: opts.backend } : undefined,
     archived: false,
+    lifecycle: 'open',
+    workspaceId: opts.workspaceId,
+    workspacePath: opts.workspacePath,
+    projectId: opts.projectId,
   };
   data.activeByContext[contextKey] = appId;
   saveSessionsToFile();
@@ -327,13 +400,37 @@ export function createSession(
 export function setProviderSessionId(
   appSessionId: string,
   providerSessionId: string,
-  backend?: string
+  backend?: string,
+  model?: string,
+  effort?: string,
+  sessionMode?: ProviderSessionMode
 ): void {
   const entry = data.sessions[appSessionId];
   if (!entry) return;
   entry.agent = {
     backend: backend || entry.agent?.backend || 'claude-code',
+    model: model ?? entry.agent?.model,
+    effort: effort ?? entry.agent?.effort,
     providerSessionId,
+    sessionMode: sessionMode ?? entry.agent?.sessionMode,
+  };
+  entry.updatedAt = new Date().toISOString();
+  saveSessionsToFile();
+}
+
+/** Persist backend continuation semantics before a request starts, including failed requests. */
+export function setProviderSessionMode(
+  appSessionId: string,
+  backend: string,
+  sessionMode: ProviderSessionMode
+): void {
+  const entry = data.sessions[appSessionId];
+  if (!entry) return;
+  if (entry.agent?.backend === backend && entry.agent.sessionMode === sessionMode) return;
+  entry.agent = {
+    ...entry.agent,
+    backend,
+    sessionMode,
   };
   entry.updatedAt = new Date().toISOString();
   saveSessionsToFile();
@@ -361,9 +458,19 @@ export function setSession(
 export function updateSessionTitle(appSessionId: string, title: string): void {
   const entry = data.sessions[appSessionId];
   if (!entry) return;
-  entry.title = title;
+  entry.title = sanitizeSessionTitle(title);
   entry.updatedAt = new Date().toISOString();
   saveSessionsToFile();
+}
+
+/** Webセッションの所属Projectを変更する。undefinedでProjectなしへ戻す。 */
+export function updateSessionProject(appSessionId: string, projectId?: string): boolean {
+  const entry = data.sessions[appSessionId];
+  if (!entry || entry.platform !== 'web') return false;
+  entry.projectId = projectId;
+  entry.updatedAt = new Date().toISOString();
+  saveSessionsToFile();
+  return true;
 }
 
 /**
@@ -384,6 +491,9 @@ export function archiveSession(appSessionId: string): void {
   const entry = data.sessions[appSessionId];
   if (!entry) return;
   entry.archived = true;
+  entry.lifecycle = 'closed';
+  entry.closedAt = new Date().toISOString();
+  entry.closeReason = 'archive';
   // activeByContextから外す
   for (const [ctx, id] of Object.entries(data.activeByContext)) {
     if (id === appSessionId) {
@@ -401,9 +511,50 @@ export function activateSession(contextKey: string, appSessionId: string): void 
   const entry = data.sessions[appSessionId];
   if (entry) {
     entry.archived = false;
+    entry.lifecycle = 'open';
+    delete entry.closedAt;
+    delete entry.closeReason;
     entry.updatedAt = new Date().toISOString();
   }
   saveSessionsToFile();
+}
+
+/**
+ * Sessionの会話ライフサイクルを返す。
+ * 既存データにはlifecycleがないため、安全側でclosedとして扱う。
+ * 実際に次の入力を受けた時点でensureSessionが明示的にopenへ移行する。
+ */
+export function getSessionLifecycle(appSessionId: string): SessionLifecycle {
+  const entry = data.sessions[appSessionId];
+  if (!entry) return 'closed';
+  if (entry.lifecycle) return entry.lifecycle;
+  return 'closed';
+}
+
+/** Sessionを終了済みにし、次回投稿のrouting pointerから外す。履歴は削除しない。 */
+export function closeSession(appSessionId: string, reason: SessionCloseReason = 'other'): boolean {
+  const entry = data.sessions[appSessionId];
+  if (!entry) return false;
+  const now = new Date().toISOString();
+  entry.lifecycle = 'closed';
+  entry.closedAt = now;
+  entry.closeReason = reason;
+  entry.autoTalk = false;
+  entry.updatedAt = now;
+  for (const [ctx, id] of Object.entries(data.activeByContext)) {
+    if (id === appSessionId) delete data.activeByContext[ctx];
+  }
+  saveSessionsToFile();
+  return true;
+}
+
+/** contextの現在Sessionを終了する。 */
+export function closeActiveSession(
+  contextKey: string,
+  reason: SessionCloseReason = 'other'
+): boolean {
+  const appSessionId = data.activeByContext[contextKey];
+  return appSessionId ? closeSession(appSessionId, reason) : false;
 }
 
 /**
@@ -456,10 +607,18 @@ export function deleteSession(channelId: string): boolean {
  */
 export function ensureSession(
   contextKey: string,
-  opts?: { platform?: string; scope?: SessionScope; backend?: string }
+  opts?: { platform?: string; scope?: SessionScope; backend?: string } & SessionSnapshotOptions
 ): string {
   const existing = data.activeByContext[contextKey];
   if (existing && data.sessions[existing]) {
+    const entry = data.sessions[existing];
+    if (entry.lifecycle !== 'open') {
+      entry.lifecycle = 'open';
+      delete entry.closedAt;
+      delete entry.closeReason;
+      entry.updatedAt = new Date().toISOString();
+      saveSessionsToFile();
+    }
     return existing;
   }
   return createSession(contextKey, opts);
@@ -487,4 +646,18 @@ export function getSessionCount(): number {
 export function clearSessions(): void {
   data = { activeByContext: {}, sessions: {} };
   sessionsPath = null;
+}
+
+/**
+ * セッションがアイドル状態（一定時間経過）になったか判定する
+ */
+export function hasSessionGoneIdle(
+  lastActivityIso: string | undefined,
+  idleMs: number,
+  now: number = Date.now()
+): boolean {
+  if (!lastActivityIso || idleMs <= 0) return false;
+  const last = Date.parse(lastActivityIso);
+  if (!Number.isFinite(last)) return false;
+  return now - last >= idleMs;
 }

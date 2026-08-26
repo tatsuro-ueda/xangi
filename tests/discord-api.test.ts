@@ -1,5 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { resolveHistoryChannelId } from '../src/cli/discord-api.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  discordApi,
+  resolveHistoryChannelId,
+  resolveChannelId,
+  resolveLeaveUserId,
+} from '../src/cli/discord-api.js';
 import { ValidationError } from '../src/errors.js';
 
 describe('resolveHistoryChannelId', () => {
@@ -63,5 +68,83 @@ describe('resolveHistoryChannelId', () => {
     delete process.env.XANGI_CHANNEL_ID;
     const result = resolveHistoryChannelId({ channel: 'flag-only' });
     expect(result).toBe('flag-only');
+  });
+});
+
+describe('resolveChannelId error label', () => {
+  it('embeds the given command label in the missing-channel error', () => {
+    delete process.env.XANGI_CHANNEL_ID;
+    expect(() => resolveChannelId({}, {}, 'discord_thread_leave')).toThrow(
+      /discord_thread_leave: channel が未指定/
+    );
+  });
+});
+
+describe('resolveLeaveUserId', () => {
+  it('returns the --user value when provided', () => {
+    expect(resolveLeaveUserId({ user: '111222333' })).toBe('111222333');
+  });
+
+  it('throws a discord_thread_leave-labelled error when --user is missing', () => {
+    expect(() => resolveLeaveUserId({})).toThrow(/discord_thread_leave: user が未指定/);
+    expect(() => resolveLeaveUserId({})).toThrow(ValidationError);
+  });
+});
+
+describe('discord_message', () => {
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.DISCORD_TOKEN;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalToken === undefined) {
+      delete process.env.DISCORD_TOKEN;
+    } else {
+      process.env.DISCORD_TOKEN = originalToken;
+    }
+  });
+
+  it('fetches one message and returns its content without the history 200-character truncation', async () => {
+    process.env.DISCORD_TOKEN = 'test-token';
+    const fullContent = '長文'.repeat(300);
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          id: 'message-456',
+          content: fullContent,
+          author: { id: 'author-1', username: 'writer', discriminator: '0' },
+          timestamp: '2026-07-18T21:30:00.000Z',
+          attachments: [],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const result = await discordApi(
+      'discord_message',
+      { channel: 'channel-123', 'message-id': 'message-456' },
+      { channelId: 'context-channel' }
+    );
+
+    expect(result).toContain(fullContent);
+    expect(result).toContain('(ID:message-456) writer:');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://discord.com/api/v10/channels/channel-123/messages/message-456',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bot test-token' }),
+      })
+    );
+  });
+
+  it('requires --message-id before calling Discord', async () => {
+    process.env.DISCORD_TOKEN = 'test-token';
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    await expect(
+      discordApi('discord_message', { channel: 'channel-123' }, { channelId: 'context-channel' })
+    ).rejects.toThrow(/discord_message: message-id が未指定/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

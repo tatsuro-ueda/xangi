@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Scheduler, parseScheduleInput, formatScheduleList } from '../src/scheduler.js';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -107,6 +107,15 @@ describe('parseScheduleInput', () => {
     expect(result).not.toBeNull();
     expect(result!.type).toBe('startup');
     expect(result!.message).toBe('ウェルカムメッセージ');
+  });
+
+  it('should parse "起動時に メッセージ" without widening other forms', () => {
+    const result = parseScheduleInput('起動時に ウェルカムメッセージ');
+    expect(result).not.toBeNull();
+    expect(result!.type).toBe('startup');
+    expect(result!.message).toBe('ウェルカムメッセージ');
+    expect(parseScheduleInput('起動時に')).toBeNull();
+    expect(parseScheduleInput('起動時には ウェルカムメッセージ')).toBeNull();
   });
 
   it('should parse "startup メッセージ"', () => {
@@ -241,6 +250,65 @@ describe('Scheduler', () => {
 
     const toggledBack = scheduler.toggle(schedule.id);
     expect(toggledBack?.enabled).toBe(true);
+  });
+
+  it('should update a schedule while preserving identity and enabled state', () => {
+    const schedule = scheduler.add({
+      type: 'cron',
+      expression: '0 9 * * *',
+      message: 'before',
+      channelId: '__new__',
+      platform: 'web',
+      projectId: 'project-1',
+    });
+    scheduler.toggle(schedule.id);
+
+    const updated = scheduler.update(schedule.id, {
+      type: 'once',
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      message: 'after',
+      channelId: 'thread-456',
+      platform: 'discord',
+      label: 'edited',
+    });
+
+    expect(updated).toEqual(
+      expect.objectContaining({
+        id: schedule.id,
+        createdAt: schedule.createdAt,
+        enabled: false,
+        type: 'once',
+        message: 'after',
+        channelId: 'thread-456',
+        platform: 'discord',
+        label: 'edited',
+      })
+    );
+    expect(updated?.projectId).toBeUndefined();
+  });
+
+  it('keeps memory and persisted state unchanged when an update cannot be saved', () => {
+    const schedule = scheduler.add({
+      type: 'startup',
+      message: 'before',
+      channelId: 'ch1',
+      platform: 'discord',
+    });
+    const filePath = join(tmpDir, 'schedules.json');
+    const before = readFileSync(filePath, 'utf-8');
+    mkdirSync(`${filePath}.tmp`);
+
+    expect(() =>
+      scheduler.update(schedule.id, {
+        type: 'startup',
+        message: 'after',
+        channelId: 'ch1',
+        platform: 'discord',
+      })
+    ).toThrow();
+
+    expect(scheduler.get(schedule.id)?.message).toBe('before');
+    expect(readFileSync(filePath, 'utf-8')).toBe(before);
   });
 
   it('should persist schedules to file', () => {

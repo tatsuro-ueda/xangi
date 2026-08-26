@@ -24,8 +24,14 @@ export const ALLOWED_ENV_KEYS = [
   'AGENT_MODEL',
   'SKIP_PERMISSIONS',
   'DATA_DIR',
+  // extension CLI must address the registry owned by this xangi instance
+  'XANGI_EXTENSIONS_FILE',
   'XANGI_TOOL_SERVER',
   'XANGI_CHANNEL_ID',
+  'XANGI_PLATFORM',
+  'XANGI_BACKEND_EXECUTABLE',
+  // OpenCode provider/model config file path (the file may reference provider credentials).
+  'OPENCODE_CONFIG',
 ];
 
 /**
@@ -39,7 +45,7 @@ export function getSafeEnv(): NodeJS.ProcessEnv {
     }
   }
 
-  // xangi-cmd (bin/) をPATHに追加
+  // 現在のinstanceに付属するxangi / xangi-cmd (bin/) をPATH先頭に固定
   if (env.PATH && XANGI_BIN_DIR) {
     env.PATH = `${XANGI_BIN_DIR}:${env.PATH}`;
   }

@@ -1,10 +1,18 @@
 import type { RunOptions, RunResult, StreamCallbacks } from './agent-runner.js';
+import {
+  extractAntigravityErrorMessage,
+  isAntigravityWorkspaceArtifactPathError,
+  reportsUnsupportedOutputFormat,
+} from './antigravity-output.js';
 import { buildSystemPrompt } from './base-runner.js';
 import type { BaseRunnerOptions } from './base-runner.js';
 import { prependRuntimeContext } from './runtime-context.js';
 import { logPrompt, logResponse } from './transcript-logger.js';
 import { CliRunnerBase, type CliStreamParser } from './cli-runner-core.js';
+import { clearManagedCliProcess, registerManagedCliProcess } from './cli-process.js';
 import type { ChatPlatform } from './prompts/index.js';
+import { configuredBackendCommand } from './setup/backend-executable.js';
+import { spawn } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, basename } from 'node:path';
@@ -14,6 +22,10 @@ export interface AntigravityOptions extends BaseRunnerOptions {
 }
 
 interface AntigravityJsonResponse {
+  status?: string;
+  duration_seconds?: number;
+  num_turns?: number;
+  usage?: AntigravityUsage;
   result?: string;
   text?: string;
   content?: string;
@@ -28,7 +40,78 @@ interface AntigravityJsonResponse {
   message?: string | { content?: unknown };
 }
 
+interface AntigravityUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  thinking_tokens?: number;
+  cache_read_tokens?: number;
+  total_tokens?: number;
+}
+
+interface AntigravityToolInfo {
+  name?: string;
+  parameters?: unknown;
+  output?: unknown;
+  error?: string | { message?: string; type?: string };
+}
+
+interface AntigravitySubagentInfo {
+  conversation_id?: string;
+  log_uri?: string;
+}
+
+interface AntigravityStreamEvent {
+  event?: string;
+  conversation_id?: string;
+  init?: {
+    conversation_id?: string;
+    cwd?: string;
+    tools?: string[];
+    permission_mode?: string;
+  };
+  step_update?: {
+    conversation_id?: string;
+    step_index?: number;
+    state?: string;
+    step_type?: string;
+    text_delta?: string;
+    tool_name?: string;
+    tool_info?: AntigravityToolInfo;
+    subagent_info?: AntigravitySubagentInfo;
+    usage?: AntigravityUsage;
+  };
+  result?: AntigravityJsonResponse;
+}
+
 type ConversationSnapshot = Map<string, number>;
+type OutputCapability = 'unknown' | 'json' | 'legacy';
+type StreamOutputCapability = 'unknown' | 'stream-json' | 'legacy';
+type SlashCommandCapabilityProbeResult = 'supported' | 'unsupported' | 'unknown';
+
+const CAPABILITY_PROBE_TIMEOUT_MS = 5_000;
+const WORKSPACE_WRITE_SYSTEM_GUIDANCE = `## Antigravity workspace file writes
+When calling write_to_file for a normal file in the current workspace, omit ArtifactMetadata entirely. ArtifactMetadata is reserved for Antigravity's internal artifact directory, not workspace files.`;
+const WORKSPACE_WRITE_RECOVERY_PROMPT = `The preceding write_to_file call failed because ArtifactMetadata was attached to a normal workspace path. Continue the same task from that failed write only. Retry that write without the ArtifactMetadata field and preserve the requested workspace path. Do not repeat completed tool calls or external side effects. Then finish the task normally.`;
+
+interface AntigravityOutputError extends Error {
+  antigravityStdout?: string;
+  antigravityStderr?: string;
+}
+
+interface AntigravityAttemptOptions {
+  recordPrompt?: boolean;
+}
+
+class AntigravityConversationError extends Error {
+  constructor(
+    message: string,
+    readonly conversationId?: string,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+    this.name = 'AntigravityConversationError';
+  }
+}
 
 export class AntigravityRunner extends CliRunnerBase {
   protected readonly command = 'agy';
@@ -36,14 +119,37 @@ export class AntigravityRunner extends CliRunnerBase {
   protected readonly logPrefix = 'antigravity';
 
   private systemPrompt: string;
+  private readonly printTimeout: string;
+  private readonly disableSlashCommands: boolean;
+  private slashCommandCapability?: boolean;
+  private readonly slashCommandCapabilityProbes = new Map<
+    string | undefined,
+    Promise<SlashCommandCapabilityProbeResult>
+  >();
+  /** Capability is intentionally per runner: different agy binaries may be used by different runners. */
+  private outputCapability: OutputCapability = 'unknown';
+  private streamOutputCapability: StreamOutputCapability = 'unknown';
 
   constructor(options?: AntigravityOptions) {
     super(options);
-    this.systemPrompt = buildSystemPrompt(options?.platform);
+    this.systemPrompt = [buildSystemPrompt(options?.platform), WORKSPACE_WRITE_SYSTEM_GUIDANCE]
+      .filter(Boolean)
+      .join('\n\n');
+    this.printTimeout =
+      process.env.ANTIGRAVITY_PRINT_TIMEOUT || `${Math.ceil(this.timeoutMs / 1000)}s`;
+    this.disableSlashCommands = process.env.ANTIGRAVITY_DISABLE_SLASH_COMMANDS !== 'false';
   }
 
-  private buildArgs(prompt: string, options?: RunOptions): string[] {
+  private async buildArgs(
+    prompt: string,
+    options?: RunOptions,
+    outputFormat?: 'json' | 'stream-json'
+  ): Promise<string[]> {
     const args: string[] = [];
+
+    if (await this.supportsDisableSlashCommands(options?.channelId)) {
+      args.push('--disable-slash-commands');
+    }
 
     const skip = options?.skipPermissions ?? this.skipPermissions;
     if (skip) {
@@ -54,16 +160,189 @@ export class AntigravityRunner extends CliRunnerBase {
       args.push('--model', this.model);
     }
 
+    if (options?.effort) {
+      args.push('--effort', options.effort);
+    }
+
     if (options?.sessionId) {
       args.push('--conversation', options.sessionId);
     }
 
+    // CliRunnerBase already sets cwd. agy resolves this relative directory as the same workspace.
+    if (this.workdir) {
+      args.push('--add-dir', '.');
+    }
+
+    args.push('--print-timeout', this.printTimeout);
+    if (outputFormat) {
+      args.push('--output-format', outputFormat);
+    }
     args.push('-p', prompt);
     return args;
   }
 
+  private async supportsDisableSlashCommands(channelId?: string): Promise<boolean> {
+    if (!this.disableSlashCommands) return false;
+    if (this.slashCommandCapability !== undefined) return this.slashCommandCapability;
+
+    // Share only within the same channel. This preserves per-channel cancellation while ensuring
+    // concurrent requests cannot overwrite each other's managed probe process.
+    let probe = this.slashCommandCapabilityProbes.get(channelId);
+    if (!probe) {
+      probe = this.probeDisableSlashCommands(channelId);
+      this.slashCommandCapabilityProbes.set(channelId, probe);
+    }
+
+    let result: SlashCommandCapabilityProbeResult;
+    try {
+      result = await probe;
+    } finally {
+      if (this.slashCommandCapabilityProbes.get(channelId) === probe) {
+        this.slashCommandCapabilityProbes.delete(channelId);
+      }
+    }
+
+    if (result === 'supported') this.slashCommandCapability = true;
+    if (result === 'unsupported') this.slashCommandCapability = false;
+    // A timeout, spawn failure, or non-zero exit is transient: omit the flag now and retry the
+    // capability probe on the next request instead of poisoning this long-lived runner's cache.
+    return result === 'supported';
+  }
+
+  /**
+   * Agy 1.1.9 added print-mode slash expansion and its opt-out flag. Probe help instead of
+   * retrying a real prompt, so old binaries stay compatible without risking duplicate turns.
+   */
+  private probeDisableSlashCommands(
+    channelId?: string
+  ): Promise<SlashCommandCapabilityProbeResult> {
+    return new Promise((resolve, reject) => {
+      const env = this.buildEnv(channelId);
+      let settled = false;
+      let output = '';
+      let proc: ReturnType<typeof spawn> | undefined;
+
+      const cleanup = (status: 'completed' | 'error') => {
+        if (!proc) return;
+        if (this.currentProcess === proc) this.currentProcess = null;
+        if (channelId && this.activeProcesses.get(channelId) === proc) {
+          clearManagedCliProcess(channelId, this.activeProcesses, this.timeoutController, status);
+        }
+      };
+
+      const finish = (
+        result: SlashCommandCapabilityProbeResult,
+        status: 'completed' | 'error',
+        error?: Error
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup(status);
+        if (error) reject(error);
+        else resolve(result);
+      };
+
+      try {
+        proc = spawn(configuredBackendCommand(this.command, env), ['--help'], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: this.workdir,
+          env,
+        });
+      } catch (error) {
+        settled = true;
+        console.warn(
+          `[antigravity] Could not probe --disable-slash-commands; will retry on the next request: ${error instanceof Error ? error.message : String(error)}`
+        );
+        resolve('unknown');
+        return;
+      }
+
+      const spawned = proc;
+      const timer = setTimeout(() => {
+        console.warn(
+          '[antigravity] agy --help capability probe timed out; will retry on the next request'
+        );
+        finish('unknown', 'error');
+        spawned.kill();
+      }, CAPABILITY_PROBE_TIMEOUT_MS);
+      timer.unref?.();
+
+      this.currentProcess = spawned;
+      registerManagedCliProcess(channelId, spawned, this.activeProcesses, this.timeoutController);
+
+      spawned.stdout?.on('data', (data) => {
+        output += data.toString();
+      });
+      spawned.stderr?.on('data', (data) => {
+        output += data.toString();
+      });
+      spawned.on('close', (code) => {
+        // ChildProcess close is asynchronous in production. Deferring also preserves that order
+        // in tests whose mock kill emits close synchronously before cancel() clears ownership.
+        queueMicrotask(() => {
+          if (settled) return;
+          if (spawned.killed) {
+            finish('unknown', 'error', new Error('Antigravity CLI capability probe was cancelled'));
+            return;
+          }
+          const stillOwned = channelId
+            ? this.activeProcesses.get(channelId) === spawned
+            : this.currentProcess === spawned;
+          if (!stillOwned) {
+            finish('unknown', 'error', new Error('Antigravity CLI capability probe was cancelled'));
+            return;
+          }
+          if (code === 0) {
+            finish(
+              output.includes('--disable-slash-commands') ? 'supported' : 'unsupported',
+              'completed'
+            );
+            return;
+          }
+          console.warn(
+            `[antigravity] agy --help exited with code ${code}; will retry the capability probe on the next request`
+          );
+          finish('unknown', 'error');
+        });
+      });
+      spawned.on('error', (error) => {
+        console.warn(
+          `[antigravity] Could not probe --disable-slash-commands; will retry on the next request: ${error.message}`
+        );
+        finish('unknown', 'error');
+      });
+    });
+  }
+
+  private async collectAntigravityOutput(
+    args: string[],
+    channelId: string | undefined
+  ): Promise<{ stdout: string; stderr: string }> {
+    let stderr = '';
+    let stdoutOnError = '';
+    try {
+      const stdout = await this.collectOutput(args, channelId, {
+        encoding: 'utf8',
+        exitErrorDetail: (output) => {
+          stdoutOnError = output;
+          return this.extractExitErrorDetail(output);
+        },
+        onStderr: (output) => {
+          stderr = output;
+        },
+      });
+      return { stdout, stderr };
+    } catch (error) {
+      const outputError = error as AntigravityOutputError;
+      outputError.antigravityStdout = stdoutOnError;
+      outputError.antigravityStderr = stderr;
+      throw outputError;
+    }
+  }
+
   private buildFullPrompt(rawPrompt: string): string {
-    const promptWithRuntime = prependRuntimeContext(rawPrompt);
+    const promptWithRuntime = prependRuntimeContext(rawPrompt, this.workdir);
     return this.systemPrompt
       ? `<system-context>\n${this.systemPrompt}\n</system-context>\n\n${promptWithRuntime}`
       : promptWithRuntime;
@@ -78,31 +357,90 @@ export class AntigravityRunner extends CliRunnerBase {
   }
 
   async run(prompt: string, options?: RunOptions): Promise<RunResult> {
+    try {
+      return await this.runOnce(prompt, options);
+    } catch (error) {
+      const conversationId = this.getWorkspaceWriteRecoveryConversationId(error, options);
+      if (!conversationId) throw error;
+
+      console.warn(
+        `[antigravity] Retrying failed workspace write without ArtifactMetadata in conversation ${conversationId.slice(0, 8)}...`
+      );
+      return this.runOnce(
+        WORKSPACE_WRITE_RECOVERY_PROMPT,
+        {
+          ...options,
+          sessionId: conversationId,
+        },
+        { recordPrompt: false }
+      );
+    }
+  }
+
+  private async runOnce(
+    prompt: string,
+    options?: RunOptions,
+    attemptOptions: AntigravityAttemptOptions = {}
+  ): Promise<RunResult> {
     const fullPrompt = this.buildFullPrompt(prompt);
-    const args = this.buildArgs(fullPrompt, options);
-    const conversationsBefore = this.snapshotConversations();
 
     this.logExecution('Executing', options);
 
-    if (options?.appSessionId && this.workdir) {
+    if (attemptOptions.recordPrompt !== false && options?.appSessionId && this.workdir) {
       logPrompt(this.workdir, options.appSessionId, fullPrompt);
     }
 
-    const stdout = await this.collectOutput(args, options?.channelId);
-    const response = this.parseResponse(stdout);
-    const result = this.extractText(response) || stdout.trim();
-    const sessionId =
-      this.extractSessionId(response) || this.findChangedConversationId(conversationsBefore);
+    const wantsJson = this.outputCapability !== 'legacy';
+    // Unknown runners need a pre-run snapshot in case they return legacy plain text.
+    // Confirmed JSON runners never consult the conversation database.
+    const conversationsBefore =
+      this.outputCapability === 'json' ? new Map<string, number>() : this.snapshotConversations();
+    let usedJson = wantsJson;
+    let execution: { stdout: string; stderr: string };
 
-    if (response && (response.is_error || response.error)) {
-      throw new Error(this.extractErrorMessage(response) ?? 'Antigravity CLI returned error');
-    }
+    try {
+      execution = await this.collectAntigravityOutput(
+        await this.buildArgs(fullPrompt, options, wantsJson ? 'json' : undefined),
+        options?.channelId
+      );
+    } catch (error) {
+      const outputError = error as AntigravityOutputError;
+      const errorJson = this.parseResponse(outputError.antigravityStdout ?? '');
+      if (errorJson?.status === 'ERROR') {
+        this.outputCapability = 'json';
+        const detail =
+          this.extractErrorMessage(errorJson) ??
+          (error instanceof Error ? error.message : String(error));
+        if (isAntigravityWorkspaceArtifactPathError(detail)) {
+          throw new AntigravityConversationError(
+            detail,
+            errorJson?.conversation_id ?? options?.sessionId,
+            { cause: error }
+          );
+        }
+        throw error;
+      }
 
-    if (!result) {
-      throw new Error(
-        'Antigravity CLI returned no output. Check ~/.gemini/antigravity-cli/log/ for quota, auth, or model errors.'
+      if (!wantsJson || !this.isUnsupportedOutputFormat(error)) {
+        throw error;
+      }
+
+      // An old agy has rejected --output-format before running the prompt. Retry exactly once.
+      this.outputCapability = 'legacy';
+      usedJson = false;
+      execution = await this.collectAntigravityOutput(
+        await this.buildArgs(fullPrompt, options),
+        options?.channelId
       );
     }
+
+    const { result, sessionId } = this.interpretOutput(
+      execution.stdout,
+      execution.stderr,
+      usedJson,
+      conversationsBefore,
+      options?.sessionId
+    );
 
     if (options?.appSessionId && this.workdir) {
       logResponse(this.workdir, options.appSessionId, { result, sessionId });
@@ -116,18 +454,338 @@ export class AntigravityRunner extends CliRunnerBase {
     callbacks: StreamCallbacks,
     options?: RunOptions
   ): Promise<RunResult> {
-    const result = await this.run(prompt, options);
-    if (result.result) {
-      callbacks.onText?.(result.result, result.result);
+    try {
+      return await this.runStreamOnce(prompt, callbacks, options);
+    } catch (error) {
+      const conversationId = this.getWorkspaceWriteRecoveryConversationId(error, options);
+      if (conversationId) {
+        console.warn(
+          `[antigravity] Continuing failed workspace write without ArtifactMetadata in conversation ${conversationId.slice(0, 8)}...`
+        );
+        const recoveryCallbacks: StreamCallbacks = {
+          ...callbacks,
+          // The first stream already announced readiness before returning its result error.
+          onBackendReady: undefined,
+        };
+        try {
+          return await this.runStreamOnce(
+            WORKSPACE_WRITE_RECOVERY_PROMPT,
+            recoveryCallbacks,
+            {
+              ...options,
+              sessionId: conversationId,
+            },
+            { recordPrompt: false }
+          );
+        } catch (recoveryError) {
+          const err =
+            recoveryError instanceof Error ? recoveryError : new Error(String(recoveryError));
+          callbacks.onError?.(err);
+          throw recoveryError;
+        }
+      }
+
+      const err = error instanceof Error ? error : new Error(String(error));
+      callbacks.onError?.(err);
+      throw error;
     }
+  }
+
+  private async runStreamOnce(
+    prompt: string,
+    callbacks: StreamCallbacks,
+    options?: RunOptions,
+    attemptOptions: AntigravityAttemptOptions = {}
+  ): Promise<RunResult> {
+    if (this.streamOutputCapability === 'legacy') {
+      return this.runPseudoStream(prompt, callbacks, options, attemptOptions);
+    }
+
+    const fullPrompt = this.buildFullPrompt(prompt);
+    this.logExecution('Streaming', options);
+
+    if (attemptOptions.recordPrompt !== false && options?.appSessionId && this.workdir) {
+      logPrompt(this.workdir, options.appSessionId, fullPrompt);
+    }
+
+    // Unknown stream capability may be Agy 1.1.2 returning plain output while ignoring
+    // --output-format. Snapshot before execution so its conversation ID can be recovered.
+    const conversationsBefore =
+      this.streamOutputCapability === 'stream-json'
+        ? new Map<string, number>()
+        : this.snapshotConversations();
+
+    const onComplete = (result: RunResult) => {
+      if (!result.sessionId && this.streamOutputCapability === 'legacy') {
+        result.sessionId =
+          this.findChangedConversationId(conversationsBefore) || options?.sessionId || '';
+      }
+      if (options?.appSessionId && this.workdir) {
+        logResponse(this.workdir, options.appSessionId, {
+          result: result.result,
+          sessionId: result.sessionId,
+        });
+      }
+    };
+
+    try {
+      return await this.executeStreamCore(
+        await this.buildArgs(fullPrompt, options, 'stream-json'),
+        callbacks,
+        {
+          channelId: options?.channelId,
+          notifyOnError: false,
+          onComplete,
+        }
+      );
+    } catch (error) {
+      if (this.isUnsupportedOutputFormat(error)) {
+        // This failure happens during flag parsing, before agy executes the prompt.
+        this.streamOutputCapability = 'legacy';
+        this.outputCapability = 'legacy';
+        const fallbackOptions = options?.appSessionId
+          ? { ...options, appSessionId: undefined }
+          : options;
+        const result = await this.runPseudoStream(
+          prompt,
+          callbacks,
+          fallbackOptions,
+          attemptOptions
+        );
+        onComplete(result);
+        return result;
+      }
+
+      throw error;
+    }
+  }
+
+  protected createStreamParser(callbacks: StreamCallbacks): CliStreamParser {
+    let fullText = '';
+    let sessionId = '';
+    let rawOutput = '';
+    let errorDetail: string | undefined;
+    let lastToolError: string | undefined;
+    let sawResult = false;
+    let sawNativeEvent = false;
+    let backendReady = false;
+    const emittedToolSteps = new Set<string>();
+
+    return {
+      handleRawLine: (line, phase) => {
+        rawOutput += phase === 'stream' ? `${line}\n` : line;
+      },
+      handleEvent: (json, phase) => {
+        const event = json as AntigravityStreamEvent;
+        const isNativeEvent =
+          (event.event === 'init' && Boolean(event.init)) ||
+          (event.event === 'step_update' && Boolean(event.step_update)) ||
+          (event.event === 'result' && Boolean(event.result?.status));
+        if (!isNativeEvent) {
+          return false;
+        }
+
+        sawNativeEvent = true;
+        this.streamOutputCapability = 'stream-json';
+        this.outputCapability = 'json';
+        sessionId = event.conversation_id ?? sessionId;
+
+        if (event.event === 'init') {
+          sessionId = event.init?.conversation_id ?? sessionId;
+          if (!backendReady) {
+            backendReady = true;
+            callbacks.onBackendReady?.();
+          }
+          return undefined;
+        }
+
+        if (event.event === 'step_update' && event.step_update) {
+          const step = event.step_update;
+          sessionId = step.conversation_id ?? sessionId;
+
+          if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
+            fullText += step.text_delta;
+            if (step.text_delta) {
+              callbacks.onText?.(step.text_delta, fullText);
+            }
+          }
+
+          if (step.step_type === 'tool') {
+            const toolName = step.tool_name ?? step.tool_info?.name ?? 'tool';
+            const input = this.toRecord(step.tool_info?.parameters);
+            const toolId =
+              step.step_index !== undefined
+                ? `${sessionId}:${step.step_index}`
+                : `${toolName}:${JSON.stringify(input)}`;
+
+            if (step.state === 'ACTIVE' && !emittedToolSteps.has(toolId)) {
+              emittedToolSteps.add(toolId);
+              callbacks.onToolUse?.(toolName, input);
+            }
+
+            if (step.state === 'ERROR') {
+              lastToolError = this.extractToolError(step.tool_info?.error, toolName);
+            }
+          }
+          return undefined;
+        }
+
+        if (event.event === 'result' && event.result) {
+          sawResult = true;
+          const result = event.result;
+          sessionId = result.conversation_id ?? sessionId;
+
+          if (result.status === 'ERROR') {
+            errorDetail = this.extractErrorMessage(result) ?? 'Antigravity CLI returned ERROR';
+            // Wait for Agy to close before starting the recovery process for this known error.
+            // Starting it directly from the data event would overlap two managed processes for
+            // the same channel and could corrupt cancellation/timeout ownership.
+            if (isAntigravityWorkspaceArtifactPathError(errorDetail)) return undefined;
+            return phase === 'stream'
+              ? new AntigravityConversationError(errorDetail, sessionId)
+              : undefined;
+          }
+          if (result.status !== 'SUCCESS') {
+            errorDetail = `Antigravity CLI returned unknown stream status${
+              result.status ? `: ${result.status}` : ''
+            }`;
+            return phase === 'stream' ? new Error(errorDetail) : undefined;
+          }
+
+          const response = typeof result.response === 'string' ? result.response : '';
+          if (!response) {
+            errorDetail =
+              lastToolError ?? 'Antigravity CLI returned SUCCESS JSON without a response';
+            if (isAntigravityWorkspaceArtifactPathError(errorDetail)) return undefined;
+            return phase === 'stream' ? new Error(errorDetail) : undefined;
+          }
+
+          if (response.startsWith(fullText)) {
+            const remaining = response.slice(fullText.length);
+            fullText = response;
+            if (remaining) callbacks.onText?.(remaining, fullText);
+          } else if (response !== fullText) {
+            // The final response is canonical. Do not emit it again after already emitted deltas.
+            fullText = response;
+          }
+        }
+
+        return undefined;
+      },
+      finalize: () => {
+        if (!sawNativeEvent) {
+          this.streamOutputCapability = 'legacy';
+          const result = rawOutput.trim();
+          if (!result) {
+            throw new Error('Antigravity CLI returned no output');
+          }
+          callbacks.onText?.(result, result);
+          return { result, sessionId };
+        }
+        if (!sawResult) {
+          throw new Error('Antigravity CLI stream ended without a result event');
+        }
+        if (errorDetail) {
+          throw new AntigravityConversationError(errorDetail, sessionId);
+        }
+        return { result: fullText, sessionId };
+      },
+      exitErrorDetail: () => errorDetail,
+      wrapExitError: (error) =>
+        sessionId && isAntigravityWorkspaceArtifactPathError(error)
+          ? new AntigravityConversationError(error.message, sessionId, { cause: error })
+          : error,
+    };
+  }
+
+  private async runPseudoStream(
+    prompt: string,
+    callbacks: StreamCallbacks,
+    options?: RunOptions,
+    attemptOptions: AntigravityAttemptOptions = {}
+  ): Promise<RunResult> {
+    const result = await this.runOnce(prompt, options, attemptOptions);
+    callbacks.onText?.(result.result, result.result);
     callbacks.onComplete?.(result);
     return result;
   }
 
-  protected createStreamParser(_callbacks: StreamCallbacks): CliStreamParser {
+  private interpretOutput(
+    stdout: string,
+    stderr: string,
+    requestedJson: boolean,
+    conversationsBefore: ConversationSnapshot,
+    priorSessionId?: string
+  ): RunResult {
+    const response = this.parseResponse(stdout);
+    const wasConfirmedJson = this.outputCapability === 'json';
+
+    if (requestedJson) {
+      if (!response) {
+        if (wasConfirmedJson || this.looksLikeNativeJsonEnvelope(stdout)) {
+          throw new Error('Antigravity CLI returned malformed JSON output');
+        }
+        this.outputCapability = 'legacy';
+        return this.buildLegacyResult(stdout, stderr, null, conversationsBefore, priorSessionId);
+      }
+
+      // Older agy versions may ignore --output-format and return an ordinary JSON answer.
+      // Native Agy envelopes always have status, so user JSON must not confirm capability.
+      if (response.status === undefined && !wasConfirmedJson) {
+        this.outputCapability = 'legacy';
+        return this.buildLegacyResult(stdout, stderr, null, conversationsBefore, priorSessionId);
+      }
+
+      this.outputCapability = 'json';
+      if (response.status === 'SUCCESS') {
+        const result = typeof response.response === 'string' ? response.response : '';
+        if (!result) {
+          throw new Error('Antigravity CLI returned SUCCESS JSON without a response');
+        }
+        return { result, sessionId: response.conversation_id ?? priorSessionId ?? '' };
+      }
+      if (response.status === 'ERROR') {
+        throw new AntigravityConversationError(
+          this.extractErrorMessage(response) ?? 'Antigravity CLI returned ERROR',
+          response.conversation_id ?? priorSessionId
+        );
+      }
+      throw new Error(
+        `Antigravity CLI returned unknown JSON status${response.status ? `: ${response.status}` : ''}`
+      );
+    }
+
+    return this.buildLegacyResult(stdout, stderr, response, conversationsBefore, priorSessionId);
+  }
+
+  private buildLegacyResult(
+    stdout: string,
+    stderr: string,
+    response: AntigravityJsonResponse | null,
+    conversationsBefore: ConversationSnapshot,
+    priorSessionId?: string
+  ): RunResult {
+    if (response && (response.is_error || response.error)) {
+      throw new Error(this.extractErrorMessage(response) ?? 'Antigravity CLI returned error');
+    }
+
+    const result = this.extractText(response) || stdout.trim();
+    if (!result) {
+      const detail = stderr.trim();
+      throw new Error(
+        detail
+          ? `Antigravity CLI returned no output: ${detail}`
+          : 'Antigravity CLI returned no output. Check ~/.gemini/antigravity-cli/log/ for quota, auth, or model errors.'
+      );
+    }
+
     return {
-      handleEvent: () => undefined,
-      finalize: () => ({ result: '', sessionId: '' }),
+      result,
+      sessionId:
+        this.extractSessionId(response) ||
+        this.findChangedConversationId(conversationsBefore) ||
+        priorSessionId ||
+        '',
     };
   }
 
@@ -135,10 +793,46 @@ export class AntigravityRunner extends CliRunnerBase {
     const trimmed = output.trim();
     if (!trimmed) return null;
     try {
-      return JSON.parse(trimmed) as AntigravityJsonResponse;
+      const parsed = JSON.parse(trimmed) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as AntigravityJsonResponse)
+        : null;
     } catch {
       return null;
     }
+  }
+
+  private extractExitErrorDetail(output: string): string | undefined {
+    const response = this.parseResponse(output);
+    if (response?.status !== 'ERROR') return undefined;
+    return this.extractErrorMessage(response) ?? 'Antigravity CLI returned ERROR';
+  }
+
+  private isUnsupportedOutputFormat(error: unknown): boolean {
+    const outputError = error as AntigravityOutputError;
+    const detail = [
+      error instanceof Error ? error.message : String(error),
+      outputError.antigravityStdout,
+      outputError.antigravityStderr,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    return reportsUnsupportedOutputFormat(detail);
+  }
+
+  private getWorkspaceWriteRecoveryConversationId(
+    error: unknown,
+    options?: RunOptions
+  ): string | undefined {
+    if (!isAntigravityWorkspaceArtifactPathError(error)) return undefined;
+    if (error instanceof AntigravityConversationError && error.conversationId) {
+      return error.conversationId;
+    }
+    return options?.sessionId;
+  }
+
+  private looksLikeNativeJsonEnvelope(output: string): boolean {
+    return /^\s*\{[\s\S]{0,200}"status"\s*:/.test(output);
   }
 
   private extractText(event: AntigravityJsonResponse | null): string {
@@ -231,11 +925,22 @@ export class AntigravityRunner extends CliRunnerBase {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : '';
   }
 
-  private extractErrorMessage(event: AntigravityJsonResponse): string | undefined {
-    const error = event.error;
-    if (typeof error === 'string') return error;
+  private toRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  }
+
+  private extractToolError(
+    error: string | { message?: string; type?: string } | undefined,
+    toolName: string
+  ): string {
+    if (typeof error === 'string') return error || `Antigravity tool failed: ${toolName}`;
     if (error?.message) return error.message;
-    if (typeof event.message === 'string' && event.is_error) return event.message;
-    return undefined;
+    return `Antigravity tool failed: ${toolName}`;
+  }
+
+  private extractErrorMessage(event: AntigravityJsonResponse): string | undefined {
+    return extractAntigravityErrorMessage(event);
   }
 }

@@ -1,8 +1,10 @@
+[English](en/events.md) | 日本語
+
 # 外部イベントストリーム（pull 型 SSE）
 
 xangi はチャット応答のライフサイクルを SSE（Server-Sent Events）で配信する。consumer（デスクトップアバター、ダッシュボード、可視化ツール等）が `GET /api/events/stream` に接続すれば、いま xangi が何をしているかをリアルタイムに購読できる。
 
-Discord / Slack / Web Chat の **全プラットフォーム共通**でイベントが流れる。consumer は `platform` フィールドや `thread_label` を見て表示分けする。
+Discord / Slack / Web Chat / LINE / Telegramの全プラットフォーム共通でイベントが流れる。consumerは`platform`フィールドや`thread_label`を見て表示分けする。
 
 ## エンドポイント
 
@@ -33,11 +35,11 @@ GET http://<xangi-host>:<WEB_CHAT_PORT>/api/events/stream
 
 ## 環境変数
 
-| 変数 | デフォルト | 説明 |
-|---|---|---|
-| `WEB_CHAT_PORT` | `18888` | SSE エンドポイントを公開する HTTP サーバのポート |
-| `XANGI_EVENTS_ENABLED` | `true` | `false` で完全に無効化（接続要求は 503 で返す） |
-| `XANGI_INSTANCE_ID` | `xangi-<hostname>-<sha1(DATA_DIR)[:6]>` | このインスタンスを区別する識別子。複数の xangi を同じ consumer に繋ぐときに consumer 側でフィルタするために使う |
+| 変数                   | デフォルト                              | 説明                                                                                                            |
+| ---------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `WEB_CHAT_PORT`        | `18888`                                 | SSE エンドポイントを公開する HTTP サーバのポート                                                                |
+| `XANGI_EVENTS_ENABLED` | `true`                                  | `false` で完全に無効化（接続要求は 503 で返す）                                                                 |
+| `XANGI_INSTANCE_ID`    | `xangi-<hostname>-<sha1(DATA_DIR)[:6]>` | このインスタンスを区別する識別子。複数の xangi を同じ consumer に繋ぐときに consumer 側でフィルタするために使う |
 
 ### `instance_id` の自動採番
 
@@ -69,24 +71,26 @@ XANGI_INSTANCE_ID=xangi-prod
 
 ```jsonc
 {
-  "type":         "<event type>",
-  "instance_id":  "xangi-prod",         // 送信元 xangi の識別子
-  "host_hint":    "<hostname>",         // 表示用ヒント（実体は instance_id を使う）
-  "platform":     "discord",            // "discord" | "slack" | "web"
-  "thread_id":    "discord:<channelId>",
-  "turn_id":      "discord-msg-<messageId>",
-  "thread_label": "#general",           // 人間が読む表示名（任意）
-  "ts":           1730000000            // unix 秒
+  "type": "<event type>",
+  "instance_id": "xangi-prod", // 送信元 xangi の識別子
+  "host_hint": "<hostname>", // 表示用ヒント（実体は instance_id を使う）
+  "platform": "discord", // "discord" | "slack" | "web" | "line" | "telegram"
+  "thread_id": "discord:<channelId>",
+  "turn_id": "discord-msg-<messageId>",
+  "thread_label": "#general", // 人間が読む表示名（任意）
+  "ts": 1730000000, // unix 秒
 }
 ```
 
 ### `thread_id` の組み立て
 
-| platform | thread_id | turn_id | thread_label の例 |
-|---|---|---|---|
-| discord | `discord:<channelId>` | `discord-msg-<messageId>` | `#general` / `DM` |
-| slack | `slack:<channelId>` | `slack-msg-<ts>` | `#general` / `Slack DM` |
-| web | `web:<appSessionId>` | `web-msg-<unix-ms>` | セッションタイトル / `Browser session` |
+| platform | thread_id             | turn_id                    | thread_label の例                      |
+| -------- | --------------------- | -------------------------- | -------------------------------------- |
+| discord  | `discord:<channelId>` | `discord-msg-<messageId>`  | `#general` / `DM`                      |
+| slack    | `slack:<channelId>`   | `slack-msg-<ts>`           | `#general` / `Slack DM`                |
+| web      | `web:<appSessionId>`  | `web-msg-<unix-ms>`        | セッションタイトル / `Browser session` |
+| line     | `line:<userId>`       | `line-msg-<messageId>`     | `LINE 1:1 (<userId>…)`                 |
+| telegram | `telegram:<chatId>`   | `telegram-msg-<messageId>` | `Telegram Chat (<chatId>)`             |
 
 ### `turn.started`
 
@@ -131,6 +135,14 @@ XANGI_INSTANCE_ID=xangi-prod
 
 ```jsonc
 { "type": "agent.error", ..., "message": "<error message>" }
+```
+
+### `timeout.extended`
+
+Web Chatで長時間turnのタイムアウトを延長したときに通知される。時刻はUnix epoch milliseconds、時間はmilliseconds。
+
+```jsonc
+{ "type": "timeout.extended", ..., "timeout_at": 1730002400000, "max_timeout_at": 1730036000000, "timeout_ms": 2400000, "remaining_ms": 1200000 }
 ```
 
 ## 1 ターンの流れ
@@ -230,6 +242,8 @@ events SSE は「受信専用 broadcast」が設計の核だが、consumer 側 U
 
 応答は同期で返らない。受理されたら 202 が即返り、agent の応答は既存の `/api/events/stream` 経由で全 consumer に broadcast される。「pet が話しかけて、その応答を全 pet で見る」が成立する。
 
+3種類の inbox は Web Chat と同じ回答候補設定 (`WEB_REPLY_SUGGESTIONS` / `WEB_REPLY_SUGGESTIONS_COUNT` と全体設定の override) を使う。有効時は AI が生成した候補を `GET /api/sessions/:id` の最新 assistant message にある `replySuggestions` から取得できる。内部用の候補マークアップは events SSE には配信されない。
+
 ### エンドポイント
 
 ```
@@ -246,11 +260,11 @@ Authorization: Bearer <TOKEN>   ← token 設定時のみ必須
 }
 ```
 
-| フィールド | 必須 | 説明 |
-|---|---|---|
-| `text` | yes | ユーザー発話。空文字 / 8000 文字超で 400 |
-| `appSessionId` | no | 指定なら既存 web セッションへ追記。未指定なら最新 web セッションを再利用、無ければ新規作成 |
-| `source` | no | `device` / `terminal` 系の表示ラベル用。例: `g2` |
+| フィールド     | 必須 | 説明                                                                                       |
+| -------------- | ---- | ------------------------------------------------------------------------------------------ |
+| `text`         | yes  | ユーザー発話。空文字 / 8000 文字超で 400                                                   |
+| `appSessionId` | no   | 指定なら既存 web セッションへ追記。未指定なら最新 web セッションを再利用、無ければ新規作成 |
+| `source`       | no   | `device` / `terminal` 系の表示ラベル用。例: `g2`                                           |
 
 ### レスポンス
 
@@ -258,42 +272,42 @@ Authorization: Bearer <TOKEN>   ← token 設定時のみ必須
 
 ```jsonc
 {
-  "accepted":     true,
-  "instance_id":  "xangi-prod",
-  "thread_id":    "web:<appSessionId>",
-  "turn_id":      "web-msg-pet-<unix-ms>",
-  "session_id":   "<appSessionId>",
-  "events_url":   "/api/events/stream?thread_id=web%3A<appSessionId>"
+  "accepted": true,
+  "instance_id": "xangi-prod",
+  "thread_id": "web:<appSessionId>",
+  "turn_id": "web-msg-pet-<unix-ms>",
+  "session_id": "<appSessionId>",
+  "events_url": "/api/events/stream?thread_id=web%3A<appSessionId>",
 }
 ```
 
 エラー:
 
-| status | reason |
-|---|---|
-| 400 | text 空 / 長すぎ / 不正 JSON |
-| 401 | token 設定済みで `Authorization` 不一致 |
-| 403 | token 未設定で **グローバル IP** からアクセス (LAN / Tailscale は通る) |
-| 409 | 同一 session に並行送信 / web 以外の platform |
-| 503 | `XANGI_PET_INBOX_ENABLED=false` / `XANGI_DEVICE_INBOX_ENABLED=false` で無効化 |
+| status | reason                                                                        |
+| ------ | ----------------------------------------------------------------------------- |
+| 400    | text 空 / 長すぎ / 不正 JSON                                                  |
+| 401    | token 設定済みで `Authorization` 不一致                                       |
+| 403    | token 未設定で **グローバル IP** からアクセス (LAN / Tailscale は通る)        |
+| 409    | 同一 session に並行送信 / web 以外の platform                                 |
+| 503    | `XANGI_PET_INBOX_ENABLED=false` / `XANGI_DEVICE_INBOX_ENABLED=false` で無効化 |
 
 ### 環境変数
 
-| 変数 | デフォルト | 説明 |
-|---|---|---|
-| `XANGI_PET_INBOX_ENABLED` | `true` | `false` で完全に無効化 (503 を返す) |
-| `XANGI_PET_INBOX_TOKEN` | (未設定) | pet/device/terminal 共通の fallback token。設定時は `Authorization: Bearer <token>` 必須 |
-| `XANGI_DEVICE_INBOX_ENABLED` | `true` | `false` で `/api/device/inbox` と `/api/terminal/inbox` を無効化 |
-| `XANGI_DEVICE_INBOX_TOKEN` | (未設定) | device/terminal 用 token。未設定時は `XANGI_PET_INBOX_TOKEN` に fallback |
+| 変数                         | デフォルト | 説明                                                                                     |
+| ---------------------------- | ---------- | ---------------------------------------------------------------------------------------- |
+| `XANGI_PET_INBOX_ENABLED`    | `true`     | `false` で完全に無効化 (503 を返す)                                                      |
+| `XANGI_PET_INBOX_TOKEN`      | (未設定)   | pet/device/terminal 共通の fallback token。設定時は `Authorization: Bearer <token>` 必須 |
+| `XANGI_DEVICE_INBOX_ENABLED` | `true`     | `false` で `/api/device/inbox` と `/api/terminal/inbox` を無効化                         |
+| `XANGI_DEVICE_INBOX_TOKEN`   | (未設定)   | device/terminal 用 token。未設定時は `XANGI_PET_INBOX_TOKEN` に fallback                 |
 
 ### 認証モデル
 
-| 条件 | 振る舞い |
-|---|---|
+| 条件                                                        | 振る舞い             |
+| ----------------------------------------------------------- | -------------------- |
 | `XANGI_PET_INBOX_TOKEN` 未設定 + loopback / LAN / Tailscale | ✅ 許可 (デフォルト) |
-| `XANGI_PET_INBOX_TOKEN` 未設定 + グローバル IP | ❌ 403 |
-| `XANGI_PET_INBOX_TOKEN` 設定済み + Bearer 一致 | ✅ 許可 |
-| `XANGI_PET_INBOX_TOKEN` 設定済み + Bearer 不一致 | ❌ 401 |
+| `XANGI_PET_INBOX_TOKEN` 未設定 + グローバル IP              | ❌ 403               |
+| `XANGI_PET_INBOX_TOKEN` 設定済み + Bearer 一致              | ✅ 許可              |
+| `XANGI_PET_INBOX_TOKEN` 設定済み + Bearer 不一致            | ❌ 401               |
 
 「ローカル」とみなす範囲:
 
@@ -326,7 +340,7 @@ curl -N 'http://localhost:18888/api/events/stream?thread_id=web:<appSessionId>'
 
 `@evenrealities/even-terminal` の公式クライアントが期待する HTTP API の最小互換レイヤも、同じ Web Chat サーバ上で提供している。Even G2 のターミナルモードから xangi を直接ホストとして指定する用途向け。
 
-公式 Even Terminal は `claude` / `codex` provider を選ばせるが、xangi ではこの値を UI 互換のラベルとして受け取るだけ。実際に使う backend は xangi の通常設定 (`AGENT_BACKEND=claude-code|codex|cursor|grok|antigravity|local-llm`) で決まる。つまり Even 側に Local LLM の選択肢が無くても、xangi 側を `AGENT_BACKEND=local-llm` にすれば Local LLM に流せる。
+公式 Even Terminal は `claude` / `codex` provider を選ばせるが、xangi ではこの値を UI 互換のラベルとして受け取るだけ。実際に使うbackendはxangiの通常設定で決まり、組み込みbackendに加えてリンク済み拡張が宣言したbackend IDも利用できる。
 
 Even Terminal 経由だけ別の backend / model / Local LLM mode を使いたい場合は、`XANGI_EVEN_TERMINAL_BACKEND` / `XANGI_EVEN_TERMINAL_MODEL` / `XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE` を設定する。`CHANNEL_OVERRIDES` に `web-chat:<appSessionId>` がある場合は、個別 session の override が専用 default より優先される。
 
@@ -368,7 +382,7 @@ POST /api/interrupt
 {
   "text": "メガネからの入力",
   "sessionId": "<optional xangi web appSessionId>",
-  "provider": "codex"
+  "provider": "codex",
 }
 ```
 
@@ -382,13 +396,13 @@ POST /api/interrupt
 
 xangi の lifecycle events は、Even Terminal が表示しやすい形に変換される。
 
-| xangi event | Even Terminal 互換 message |
-|---|---|
-| `turn.started` | `{ "type": "user_prompt", "text": "..." }` |
-| `message.delta` | `{ "type": "text_delta", "text": "..." }` |
-| `turn.complete` | `{ "type": "result", "success": true, "text": "..." }` |
-| `turn.aborted` | `{ "type": "result", "success": false, "text": "Turn aborted" }` |
-| `agent.error` | `{ "type": "error", "message": "..." }` |
+| xangi event     | Even Terminal 互換 message                                       |
+| --------------- | ---------------------------------------------------------------- |
+| `turn.started`  | `{ "type": "user_prompt", "text": "..." }`                       |
+| `message.delta` | `{ "type": "text_delta", "text": "..." }`                        |
+| `turn.complete` | `{ "type": "result", "success": true, "text": "..." }`           |
+| `turn.aborted`  | `{ "type": "result", "success": false, "text": "Turn aborted" }` |
+| `agent.error`   | `{ "type": "error", "message": "..." }`                          |
 
 `permission-response` / `question-response` / `interrupt` は、現時点では xangi 側の承認・質問フローへは接続せず、互換性維持のため `{"ok":true,"ignored":true}` を返す。
 

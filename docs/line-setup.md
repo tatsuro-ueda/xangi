@@ -1,3 +1,5 @@
+[English](en/line-setup.md) | 日本語
+
 # LINE Messaging API セットアップガイド
 
 xangi を LINE Bot として動かすための設定手順。1:1 chat 想定。
@@ -32,11 +34,17 @@ xangi を LINE Bot として動かすための設定手順。1:1 chat 想定。
 - 「Auto-reply messages」: 「LINE Official Account Manager」で無効化 (応答メッセージを xangi に任せるため)
 - 「Greeting messages」: お好み (友だち追加直後の挨拶。xangi の応答とは独立)
 
-## 4. xangi 側の `.env` 設定
+## 4. トークンを設定
 
 ```bash
-LINE_CHANNEL_ACCESS_TOKEN=<step 2 でコピーしたトークン>
-LINE_CHANNEL_SECRET=<step 2 でコピーしたシークレット>
+xangi settings
+```
+
+開いたローカル設定画面のLINE欄へChannel access tokenとChannel secretを貼り付けて保存する。
+
+source checkoutで詳細設定を行う場合、許可ユーザーIDなど機密ではない値は`.env`へ設定できる。
+
+```bash
 LINE_ALLOWED_USER=<反応したい LINE userId、カンマ区切り、"*" で全許可>
 # Optional: webhook
 LINE_WEBHOOK_PORT=8765
@@ -86,7 +94,7 @@ LINE 公式アカウントの QR コード (「Messaging API」タブの下の�
 
 - LINE Webhook は `X-Line-Signature` ヘッダの HMAC-SHA256 で署名検証される。`@line/bot-sdk` の `validateSignature` で自動検証 (Channel secret を知らないと正しい署名が作れない)
 - `LINE_ALLOWED_USER` で `*` 全許可は推奨しない。1:1 用途なら特定の userId のみ
-- Channel access token / secret は `.env` に保存し、リポジトリに commit しない (`.env` は `.gitignore` 済)
+- Channel access token / secretは`xangi settings`で保存し、GitやAIとの会話へ貼り付けない
 
 ## 応答性とコンテキスト UX
 

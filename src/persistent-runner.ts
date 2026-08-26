@@ -16,6 +16,7 @@ import type { ChatPlatform } from './prompts/index.js';
 import { logPrompt, logResponse, logError } from './transcript-logger.js';
 import { buildCliEnv } from './cli-process.js';
 import { appendJsonlChunk } from './jsonl-buffer.js';
+import { configuredBackendCommand } from './setup/backend-executable.js';
 
 /**
  * リクエストキューのアイテム
@@ -67,6 +68,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
   private resumeSessionId?: string; // プロセス再起動時に --resume で復元するセッションID
   private channelId?: string; // トランスクリプトログ用
   private appSessionId?: string; // xangi側のセッションID
+  private platform?: ChatPlatform;
   private effort?: string; // Claude Code の --effort オプション
   private bare: boolean;
   private maxBudgetUsd?: string;
@@ -88,6 +90,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
     this.skipPermissions = options?.skipPermissions ?? false;
     this.systemPrompt = buildPersistentSystemPrompt(options?.platform);
     this.channelId = options?.channelId;
+    this.platform = options?.platform;
     this.effort = options?.effort;
     this.bare = process.env.CLAUDE_CODE_BARE === 'true';
     this.maxBudgetUsd = process.env.CLAUDE_CODE_MAX_BUDGET_USD?.trim() || undefined;
@@ -163,10 +166,11 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
 
     console.log('[persistent-runner] Starting persistent process...');
 
-    const proc = spawn('claude', args, {
+    const env = this.buildEnv();
+    const proc = spawn(configuredBackendCommand('claude', env), args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.workdir,
-      env: this.buildEnv(),
+      env,
     });
     this.process = proc;
     this.processAlive = true;
@@ -262,7 +266,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
   }
 
   private buildEnv(): NodeJS.ProcessEnv {
-    const env = buildCliEnv(this.channelId);
+    const env = buildCliEnv(this.channelId, this.platform, this.workdir);
     if (process.env.ANTHROPIC_API_KEY) {
       env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
     }
@@ -464,7 +468,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       type: 'user',
       message: {
         role: 'user',
-        content: prependRuntimeContext(sanitizeSurrogates(this.currentItem.prompt)),
+        content: prependRuntimeContext(sanitizeSurrogates(this.currentItem.prompt), this.workdir),
       },
     };
 

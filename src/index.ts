@@ -1,74 +1,68 @@
 import { Client, GatewayIntentBits, Events, Partials, REST, Routes } from 'discord.js';
 import { loadConfig } from './config.js';
-import { requestApproval, setApprovalEnabled } from './approval.js';
 import { getBackendDisplayName } from './agent-runner.js';
 import { BackendResolver } from './backend-resolver.js';
 import { DynamicRunnerManager } from './dynamic-runner.js';
 import { loadSkills } from './skills.js';
 import { startSlackBot } from './slack.js';
 import { initSettings, loadSettings } from './settings.js';
-import lockfile from 'proper-lockfile';
-import { Scheduler } from './scheduler.js';
+import { Scheduler, type Platform } from './scheduler.js';
 import { initSessions } from './sessions.js';
-import { join } from 'path';
+import { join, resolve } from 'path';
+import { realpathSync } from 'fs';
+import { initTranscriptStorage } from './transcript-logger.js';
+import { WorkspaceRegistry } from './workspace-registry.js';
 import { config as dotenvConfig } from 'dotenv';
 import { startWebChat } from './web-chat.js';
 import { startLineBot } from './line.js';
+import { startTelegramBot } from './telegram.js';
 import { getEventsConfig } from './events-emitter.js';
 import { startInterInstanceChat, getInterChatConfig } from './inter-instance-chat/index.js';
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { registerDiscordTimeoutUi } from './discord/ui.js';
 import {
   buildSlashCommands,
   createInteractionHandler,
   type SkillsRef,
 } from './discord/slash-commands.js';
-import { registerDiscordMessageHandlers } from './discord/message-handler.js';
+import {
+  processReplySuggestion,
+  registerDiscordMessageHandlers,
+  type DiscordRemoteInputBridge,
+} from './discord/message-handler.js';
 import { finalizeActiveStreams } from './stream-finalizer.js';
 import { registerDiscordSchedulerBridge } from './discord/scheduler-bridge.js';
+import {
+  resolveCachedDiscordDestinationLabel,
+  warmDiscordScheduleDestinations,
+} from './discord/destination-label.js';
+import { runShutdownCleanup } from './shutdown.js';
+import { processManager } from './process-manager.js';
+import { getSelfLifecyclePermission } from './self-lifecycle.js';
+import { loadStoredSecrets } from './setup/runtime-secrets.js';
+import { applySetupRuntimeEnvFromProcess } from './installer/runtime-config.js';
+import { acquireDataDirLock } from './data-dir-lock.js';
+import { startPlatformWithRetry } from './platform-startup-retry.js';
+import { startAutostartExtensions, stopManagedExtensions } from './extensions.js';
 dotenvConfig({ override: true });
-
-/**
- * dataDir を flock 風に排他ロックする。
- * 同じ dataDir を複数の xangi インスタンスで共有すると sessions.json を
- * 取り合って書き潰し合うため、起動時に警告して回避を促す。
- *
- * 取得成功時は release 関数を返す。取得失敗時 (別インスタンスが使用中) は
- * 警告を出して null を返す (起動は継続する; 重複検知はあくまで助言)。
- *
- * proper-lockfile は mtime ハートビート (`update`) で生存を示し、`stale` 時間
- * 経過後は強制取得を許す。crash で残った lock は次起動時に自動回収される。
- */
-async function acquireDataDirLock(dataDir: string): Promise<(() => Promise<void>) | null> {
-  try {
-    const release = await lockfile.lock(dataDir, {
-      stale: 60_000, // 60s 以上 mtime が更新されてなければ stale とみなす
-      update: 30_000, // 30s ごとに mtime を更新 (heartbeat)
-      retries: 0, // すぐに ELOCKED を返す
-    });
-    return release;
-  } catch (err) {
-    const code =
-      err && typeof err === 'object' && 'code' in err ? (err as { code: string }).code : '';
-    if (code === 'ELOCKED') {
-      console.warn(`[xangi] ⚠️  Another xangi process is using the same dataDir: ${dataDir}`);
-      console.warn(
-        `[xangi] ⚠️  Sessions and settings will be overwritten unpredictably. Set DATA_DIR to a separate path for this instance.`
-      );
-    } else {
-      console.warn(`[xangi] Failed to acquire dataDir lock: ${err}`);
-    }
-    return null;
-  }
-}
+await applySetupRuntimeEnvFromProcess();
+await loadStoredSecrets();
 
 async function main() {
   const config = loadConfig();
+  const workdir = realpathSync(resolve(config.agent.config.workdir || process.cwd()));
+  config.agent.config.workdir = workdir;
+  await startAutostartExtensions({ workspace: config.agent.config.workdir });
+  const discordRemoteInputRef: { current?: DiscordRemoteInputBridge } = {};
+  const destinationLabelResolverRef: {
+    current?: (platform: Platform, destinationId: string) => string | undefined;
+  } = {};
+  const platformStartupTasks: Promise<void>[] = [];
 
   // 許可リストのチェック（"*" で全員許可、カンマ区切りで複数ユーザー対応）
   const discordAllowed = config.discord.allowedUsers || [];
   const slackAllowed = config.slack.allowedUsers || [];
   const lineAllowed = config.line.allowedUsers || [];
+  const telegramAllowed = config.telegram.allowedUsers || [];
 
   if (config.discord.enabled && discordAllowed.length === 0) {
     console.error('[xangi] Error: DISCORD_ALLOWED_USER must be set (use "*" to allow everyone)');
@@ -80,6 +74,10 @@ async function main() {
   }
   if (config.line.enabled && lineAllowed.length === 0) {
     console.error('[xangi] Error: LINE_ALLOWED_USER must be set (use "*" to allow everyone)');
+    process.exit(1);
+  }
+  if (config.telegram.enabled && telegramAllowed.length === 0) {
+    console.error('[xangi] Error: TELEGRAM_ALLOWED_USER must be set (use "*" to allow everyone)');
     process.exit(1);
   }
 
@@ -100,6 +98,11 @@ async function main() {
   } else if (lineAllowed.length > 0) {
     console.log(`[xangi] LINE: Allowed users: ${lineAllowed.join(', ')}`);
   }
+  if (telegramAllowed.includes('*')) {
+    console.log('[xangi] Telegram: All users are allowed');
+  } else if (telegramAllowed.length > 0) {
+    console.log(`[xangi] Telegram: Allowed users: ${telegramAllowed.join(', ')}`);
+  }
 
   // バックエンドリゾルバー & 動的ランナーマネージャーを作成
   const resolver = new BackendResolver(config);
@@ -109,13 +112,13 @@ async function main() {
     `[xangi] Using ${backendName} as agent backend (platform: ${config.agent.platform ?? 'all'})`
   );
 
-  // スキルを読み込み（`/skills` 再読込と共有する可変参照）
-  const workdir = config.agent.config.workdir || process.cwd();
+  // スキルを読み込み（`/skill` 再読込と共有する可変参照）
   const skillsRef: SkillsRef = { current: loadSkills(workdir) };
   console.log(`[xangi] Loaded ${skillsRef.current.length} skills from ${workdir}`);
 
   // dataDir（永続データの保存先）を決定
-  const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
+  const dataDir = resolve(process.env.DATA_DIR || join(workdir, '.xangi'));
+  initTranscriptStorage(dataDir, workdir);
 
   // dataDir を排他ロック
   // 同じ dataDir を複数の xangi インスタンスで共有すると sessions.json の
@@ -125,14 +128,23 @@ async function main() {
 
   // 設定を初期化（dataDir 配下の settings.json を使用）
   initSettings(dataDir);
-  const initialSettings = loadSettings();
-  console.log(`[xangi] Settings loaded: autoRestart=${initialSettings.autoRestart}`);
+  loadSettings();
+  console.log(`[xangi] Self lifecycle permission: ${getSelfLifecyclePermission()}`);
 
   // スケジューラを初期化（ワークスペースの .xangi を使用）
   const scheduler = new Scheduler(dataDir);
 
   // セッション永続化を初期化
   initSessions(dataDir);
+
+  const configuredWorkspaceRoots = process.env.XANGI_WORKSPACE_ALLOWED_ROOTS?.split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const workspaceRegistry = await WorkspaceRegistry.open({
+    dataDir,
+    defaultWorkspacePath: workdir,
+    allowedRoots: configuredWorkspaceRoots?.length ? configuredWorkspaceRoots : undefined,
+  });
 
   // 外部イベントストリーム (pull 型 SSE) の設定をログ出力。
   // 実際の購読 URL は web-chat 起動時に Tailscale 解決込みで `[xangi-events (SSE)]
@@ -150,26 +162,59 @@ async function main() {
 
   // WebチャットUI起動
   if (process.env.WEB_CHAT_ENABLED === 'true') {
-    startWebChat({ agentRunner });
+    startWebChat({
+      agentRunner,
+      historyPrefetch: config.historyPrefetch,
+      replySuggestions: config.web,
+      config,
+      resolver,
+      scheduler,
+      skillsRef,
+      discordRemoteInputRef,
+      destinationLabelResolverRef,
+      workspaceRegistry,
+    });
   }
 
   // LINE Bot 起動 (Tailscale Funnel 等で外部公開して webhook を受ける想定)
   if (config.line.enabled) {
-    startLineBot({
-      agentRunner,
-      channelSecret: config.line.channelSecret!,
-      channelAccessToken: config.line.channelAccessToken!,
-      allowedUsers: lineAllowed,
-      port: config.line.webhookPort,
-      path: config.line.webhookPath,
-      loadingAnimationEnabled: config.line.loadingAnimationEnabled,
-      loadingAnimationSeconds: config.line.loadingAnimationSeconds,
-      slowResponseEnabled: config.line.slowResponseEnabled,
-      slowResponseThresholdMs: config.line.slowResponseThresholdMs,
-      idleResetEnabled: config.line.idleResetEnabled,
-      idleResetHours: config.line.idleResetHours,
-      resetTextPatterns: config.line.resetTextPatterns,
-    });
+    platformStartupTasks.push(
+      startLineBot({
+        agentRunner,
+        resolver,
+        channelSecret: config.line.channelSecret!,
+        channelAccessToken: config.line.channelAccessToken!,
+        allowedUsers: lineAllowed,
+        port: config.line.webhookPort,
+        path: config.line.webhookPath,
+        loadingAnimationEnabled: config.line.loadingAnimationEnabled,
+        loadingAnimationSeconds: config.line.loadingAnimationSeconds,
+        slowResponseEnabled: config.line.slowResponseEnabled,
+        slowResponseThresholdMs: config.line.slowResponseThresholdMs,
+        idleResetEnabled: config.line.idleResetEnabled,
+        idleResetHours: config.line.idleResetHours,
+        resetTextPatterns: config.line.resetTextPatterns,
+        completionDisplay: config.completion,
+        completionNotifyAfterMs: config.completion.notifyAfterMs,
+      }).then(() => {
+        console.log('[xangi] LINE bot started');
+      })
+    );
+  }
+
+  // Telegram Bot 起動。一時的な接続失敗は startTelegramBot 内で再試行する。
+  // 他platformと同時に開始し、恒久エラーは全体の起動失敗としてservice managerへ伝える。
+  if (config.telegram.enabled) {
+    platformStartupTasks.push(
+      startTelegramBot({
+        config,
+        agentRunner,
+        resolver,
+        scheduler,
+      }).then(() => {
+        console.log('[xangi] Telegram bot started');
+      })
+    );
   }
 
   // インスタンス間チャット起動 (INTER_INSTANCE_CHAT_ENABLED=true のときのみ実体起動)
@@ -182,10 +227,16 @@ async function main() {
   const { initGitHubAuth } = await import('./github-auth.js');
   initGitHubAuth();
 
-  // ツール承認の有効/無効（デフォルト無効）
-  if (process.env.APPROVAL_ENABLED === 'true') {
-    setApprovalEnabled(true);
-  }
+  // ツールサーバー起動（Claude Codeからcurlで叩くAPI）
+  // イベントトリガー（POST /api/trigger）は scheduler の agentRunner 経路を再利用
+  const { startToolServer } = await import('./tool-server.js');
+  const { EventTrigger, loadTriggerConfig } = await import('./event-trigger.js');
+  startToolServer({
+    eventTrigger: new EventTrigger(loadTriggerConfig(), scheduler, { dataDir }),
+    backendResolver: resolver,
+    config,
+    scheduler,
+  });
 
   // Discord ボット: トークン未設定 (Web オンリーモード等) では Client を生成しない。
   // 生成だけでも discord.js の内部リソースを確保するし、login しない Client が
@@ -202,6 +253,10 @@ async function main() {
       // 受け取り、必要に応じて fetch() する。
       partials: [Partials.Message, Partials.Channel],
     });
+    destinationLabelResolverRef.current = (platform, destinationId) =>
+      platform === 'discord'
+        ? resolveCachedDiscordDestinationLabel(client, destinationId)
+        : undefined;
 
     // runner の timeout-* イベントを Discord メッセージ更新に紐付け
     registerDiscordTimeoutUi(agentRunner);
@@ -212,48 +267,6 @@ async function main() {
     // スラッシュコマンド登録
     client.once(Events.ClientReady, async (c) => {
       console.log(`[xangi] Ready! Logged in as ${c.user.tag}`);
-
-      // ツール承認サーバー起動（Claude Code PreToolUseフック用）
-      const { startApprovalServer } = await import('./approval-server.js');
-      startApprovalServer(async (toolName, toolInput, dangerDescription) => {
-        // 最初のauto-replyチャンネルに承認メッセージを送信
-        const approvalChannelId = config.discord.autoReplyChannels?.[0];
-        if (!approvalChannelId) return true; // チャンネル未設定なら許可
-        const channel = c.channels.cache.get(approvalChannelId);
-        if (!channel || !('send' in channel)) return true;
-
-        const command =
-          toolName === 'Bash'
-            ? String((toolInput as Record<string, unknown>).command || '').slice(0, 200)
-            : `${toolName}: ${String((toolInput as Record<string, unknown>).file_path || '')}`;
-
-        return requestApproval(
-          approvalChannelId,
-          { command, matches: dangerDescription },
-          (approvalId, danger) => {
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId(`xangi_approve_${approvalId}`)
-                .setLabel('許可')
-                .setStyle(ButtonStyle.Success),
-              new ButtonBuilder()
-                .setCustomId(`xangi_deny_${approvalId}`)
-                .setLabel('拒否')
-                .setStyle(ButtonStyle.Danger)
-            );
-            (channel as unknown as { send: (opts: unknown) => Promise<unknown> }).send({
-              content: `⚠️ **危険なコマンドを検知**\n\`\`\`\n${danger.command}\n\`\`\`\n${danger.matches.join(', ')}\n\n2分以内に応答がなければ自動拒否`,
-              components: [row],
-            });
-          }
-        );
-      });
-
-      // ツールサーバー起動（Claude Codeからcurlで叩くAPI）
-      // イベントトリガー（POST /api/trigger）は scheduler の agentRunner 経路を再利用
-      const { startToolServer } = await import('./tool-server.js');
-      const { EventTrigger, loadTriggerConfig } = await import('./event-trigger.js');
-      startToolServer({ eventTrigger: new EventTrigger(loadTriggerConfig(), scheduler) });
 
       const rest = new REST({ version: '10' }).setToken(config.discord.token);
       try {
@@ -278,6 +291,8 @@ async function main() {
           console.log(`[xangi] ${commands.length} slash commands registered for: ${guild.name}`);
         }
 
+        await warmDiscordScheduleDestinations(client, scheduler.list());
+
         // グローバルコマンドをクリア（重複防止）
         await rest.put(Routes.applicationCommands(c.user.id), { body: [] });
         console.log('[xangi] Cleared global commands');
@@ -289,7 +304,17 @@ async function main() {
     // スラッシュコマンド・ボタン・オートコンプリート処理
     client.on(
       Events.InteractionCreate,
-      createInteractionHandler({ config, resolver, agentRunner, scheduler, workdir, skillsRef })
+      createInteractionHandler({
+        config,
+        resolver,
+        agentRunner,
+        scheduler,
+        workdir,
+        skillsRef,
+        workspaceRegistry,
+        onReplySuggestion: (interaction, suggestion) =>
+          processReplySuggestion(interaction, agentRunner, config, suggestion, workspaceRegistry),
+      })
     );
 
     // Discord APIエラーでプロセスが落ちないようにハンドリング
@@ -298,64 +323,88 @@ async function main() {
     });
 
     // メッセージ系イベント (MessageCreate / MessageUpdate / MessageDelete) を登録
-    registerDiscordMessageHandlers({ client, config, agentRunner, workdir });
-
-    // Discordボットを起動
-    await client.login(config.discord.token);
-    console.log('[xangi] Discord bot started');
+    discordRemoteInputRef.current = registerDiscordMessageHandlers({
+      client,
+      config,
+      agentRunner,
+      workdir,
+      workspaceRegistry,
+    });
 
     // スケジューラに Discord 送信関数とエージェント実行関数を登録
-    registerDiscordSchedulerBridge({ scheduler, client, config, agentRunner });
+    registerDiscordSchedulerBridge({ scheduler, client, config, agentRunner, workspaceRegistry });
+
+    // Discordの初回接続は他platformと同時に開始。一時的なDNS/接続障害は
+    // WebやSlackを止めず、同一process内で回復するまで再試行する。
+    platformStartupTasks.push(
+      startPlatformWithRetry('Discord', () => client.login(config.discord.token)).then(() => {
+        console.log('[xangi] Discord bot started');
+      })
+    );
   } // if (config.discord.enabled)
 
   // Slackボットを起動
   if (config.slack.enabled) {
-    await startSlackBot({
-      config,
-      agentRunner,
-      skills: skillsRef.current,
-      reloadSkills: () => {
-        skillsRef.current = loadSkills(workdir);
-        return skillsRef.current;
-      },
-      scheduler,
-    });
-    console.log('[xangi] Slack bot started');
+    platformStartupTasks.push(
+      startSlackBot({
+        config,
+        agentRunner,
+        resolver,
+        skills: skillsRef.current,
+        reloadSkills: () => {
+          skillsRef.current = loadSkills(workdir);
+          return skillsRef.current;
+        },
+        scheduler,
+      }).then(() => {
+        console.log('[xangi] Slack bot started');
+      })
+    );
   }
 
   const webChatEnabled = process.env.WEB_CHAT_ENABLED === 'true';
-  if (!config.discord.enabled && !config.slack.enabled && !webChatEnabled && !config.line.enabled) {
+  if (
+    !config.discord.enabled &&
+    !config.slack.enabled &&
+    !webChatEnabled &&
+    !config.line.enabled &&
+    !config.telegram.enabled
+  ) {
     console.error(
-      '[xangi] No chat platform enabled. Set DISCORD_TOKEN, SLACK_BOT_TOKEN/SLACK_APP_TOKEN, WEB_CHAT_ENABLED=true, or LINE_CHANNEL_ACCESS_TOKEN+LINE_CHANNEL_SECRET'
+      '[xangi] No chat platform enabled. Set DISCORD_TOKEN, SLACK_BOT_TOKEN/SLACK_APP_TOKEN, WEB_CHAT_ENABLED=true, LINE_CHANNEL_ACCESS_TOKEN+LINE_CHANNEL_SECRET, or TELEGRAM_BOT_TOKEN'
     );
     process.exit(1);
   }
+
+  // Discord/Slackは同時に接続する。一方が再試行中でも他方とWebは利用できる。
+  // スケジューラのstartup taskは全ての有効platformのready後に開始する。
+  await Promise.all(platformStartupTasks);
 
   // スケジューラの全ジョブを開始
   scheduler.startAll(config.scheduler);
 
   // シャットダウン時にスケジューラを停止し、dataDir ロックを解放
-  const shutdown = async () => {
-    console.log('[xangi] Shutting down scheduler...');
-    scheduler.stopAll();
-    // 実行中のストリーミング表示を「中断」表示で確定させる (issue #293)。
-    // pm2 の kill timeout (デフォルト 1600ms) 内で完了するよう内部で打ち切る
-    try {
-      await finalizeActiveStreams();
-    } catch {
-      // 後始末失敗で shutdown を阻害しない
-    }
-    if (releaseDataDirLock) {
-      try {
-        await releaseDataDirLock();
-      } catch {
-        // 解放に失敗しても次起動時に stale 検出で回収される
-      }
-    }
-    process.exit(0);
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = () => {
+    shutdownPromise ??= runShutdownCleanup({
+      stopScheduler: () => scheduler.stopAll(),
+      finalizeActiveStreams,
+      stopAgentProcesses: async () => {
+        agentRunner.shutdown();
+        await processManager.stopAllAndWait();
+      },
+      stopExtensions: stopManagedExtensions,
+      releaseDataDirLock,
+      exit: (code) => process.exit(code),
+      hardTimeoutMs: 7_000,
+    });
+    return shutdownPromise;
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error('[xangi] Fatal startup error:', error);
+  process.exit(1);
+});

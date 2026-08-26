@@ -9,8 +9,8 @@ import {
   unlinkSync,
 } from 'fs';
 import { dirname, join } from 'path';
-import cron from 'node-cron';
-import { isTransientNetworkError } from './errors.js';
+import cron, { type ScheduledTask } from 'node-cron';
+import { isNonRetryableError, isTransientNetworkError } from './errors.js';
 /** 一時的なネットワークエラー時のリトライ待機時間 (ms)。テストから上書き可能 */
 export const TRANSIENT_RETRY_DELAY_MS = process.env.VITEST ? 50 : 15_000;
 
@@ -19,7 +19,7 @@ export const SCHEDULE_SEPARATOR = '{{SPLIT}}';
 
 // ─── Types ───────────────────────────────────────────────────────────
 export type ScheduleType = 'cron' | 'once' | 'startup';
-export type Platform = 'discord' | 'slack';
+export type Platform = 'discord' | 'slack' | 'telegram' | 'web';
 export interface Schedule {
   id: string;
   type: ScheduleType;
@@ -39,17 +39,63 @@ export interface Schedule {
   enabled: boolean;
   /** ラベル（任意） */
   label?: string;
+  /** Web予定で新規会話を作る場合の論理Project ID */
+  projectId?: string;
 }
+export type ScheduleInput = Omit<Schedule, 'id' | 'createdAt' | 'enabled'>;
 export interface SendMessageFn {
   (channelId: string, message: string): Promise<void>;
 }
+export interface PlatformDeliveryReceipt {
+  /** 配信先プラットフォーム */
+  platform: Platform;
+  /** channel / chat / Web session など、プラットフォーム上の配信先 */
+  destinationId: string;
+  /** プラットフォームが発行したメッセージ ID（複数投稿なら複数） */
+  messageIds?: string[];
+  /** Web などメッセージ ID を持たない配信先のセッション参照 */
+  sessionId?: string;
+}
+export interface AgentRunContext {
+  /** 最終結果がプラットフォームへ反映された時点で呼ぶ */
+  onDelivery?: (receipt: PlatformDeliveryReceipt) => void;
+}
 export interface AgentRunFn {
-  (prompt: string, channelId: string): Promise<string>;
+  (
+    prompt: string,
+    channelId: string,
+    schedule?: Schedule,
+    context?: AgentRunContext
+  ): Promise<string>;
+}
+
+export function validateScheduleInput(schedule: ScheduleInput): void {
+  if (schedule.type === 'cron') {
+    if (!schedule.expression || !cron.validate(schedule.expression)) {
+      throw new Error(
+        `Invalid cron expression: ${schedule.expression}\n` +
+          '例: "0 9 * * *"（毎日9時）, "*/30 * * * *"（30分毎）'
+      );
+    }
+  } else if (schedule.type === 'once') {
+    if (!schedule.runAt) {
+      throw new Error('runAt is required for one-time schedule');
+    }
+    const runTime = new Date(schedule.runAt).getTime();
+    if (isNaN(runTime)) {
+      throw new Error(`Invalid date: ${schedule.runAt}`);
+    }
+    if (runTime <= Date.now()) {
+      throw new Error('runAt must be in the future');
+    }
+  } else if (schedule.type !== 'startup') {
+    throw new Error(`Unknown schedule type: ${schedule.type}`);
+  }
 }
 // ─── Scheduler ───────────────────────────────────────────────────────
 export class Scheduler {
   private schedules: Schedule[] = [];
-  private cronJobs = new Map<string, cron.ScheduledTask>();
+  private cronJobs = new Map<string, ScheduledTask>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private filePath: string;
   private senders = new Map<Platform, SendMessageFn>();
@@ -104,43 +150,47 @@ export class Scheduler {
   /**
    * スケジュールを追加
    */
-  add(schedule: Omit<Schedule, 'id' | 'createdAt' | 'enabled'>): Schedule {
-    // Validate
-    if (schedule.type === 'cron') {
-      if (!schedule.expression || !cron.validate(schedule.expression)) {
-        throw new Error(
-          `Invalid cron expression: ${schedule.expression}\n` +
-            '例: "0 9 * * *"（毎日9時）, "*/30 * * * *"（30分毎）'
-        );
-      }
-    } else if (schedule.type === 'once') {
-      if (!schedule.runAt) {
-        throw new Error('runAt is required for one-time schedule');
-      }
-      const runTime = new Date(schedule.runAt).getTime();
-      if (isNaN(runTime)) {
-        throw new Error(`Invalid date: ${schedule.runAt}`);
-      }
-      if (runTime <= Date.now()) {
-        throw new Error('runAt must be in the future');
-      }
-    } else if (schedule.type === 'startup') {
-      // startup type needs no additional validation
-    } else {
-      throw new Error(`Unknown schedule type: ${schedule.type}`);
-    }
+  add(schedule: ScheduleInput): Schedule {
+    this.validate(schedule);
     const newSchedule: Schedule = {
       ...schedule,
       id: this.generateId(),
       createdAt: new Date().toISOString(),
       enabled: true,
     };
+    this.save([...this.schedules, newSchedule]);
     this.schedules.push(newSchedule);
-    this.save();
     if (!this.disabled) {
       this.startJob(newSchedule);
     }
     return newSchedule;
+  }
+  /**
+   * スケジュール内容を更新
+   */
+  update(id: string, schedule: ScheduleInput): Schedule | undefined {
+    const index = this.schedules.findIndex((item) => item.id === id);
+    if (index === -1) return undefined;
+    this.validate(schedule);
+    const current = this.schedules[index];
+    const updated: Schedule = {
+      ...schedule,
+      id: current.id,
+      createdAt: current.createdAt,
+      enabled: current.enabled,
+    };
+    const nextSchedules = [...this.schedules];
+    nextSchedules[index] = updated;
+    this.save(nextSchedules);
+    this.stopJob(id);
+    this.schedules[index] = updated;
+    if (!this.disabled && updated.enabled) {
+      this.startJob(updated);
+    }
+    return updated;
+  }
+  private validate(schedule: ScheduleInput): void {
+    validateScheduleInput(schedule);
   }
   /**
    * スケジュールを削除
@@ -148,9 +198,9 @@ export class Scheduler {
   remove(id: string): boolean {
     const index = this.schedules.findIndex((s) => s.id === id);
     if (index === -1) return false;
+    this.save(this.schedules.filter((schedule) => schedule.id !== id));
     this.stopJob(id);
     this.schedules.splice(index, 1);
-    this.save();
     return true;
   }
   /**
@@ -178,8 +228,9 @@ export class Scheduler {
   toggle(id: string): Schedule | undefined {
     const schedule = this.schedules.find((s) => s.id === id);
     if (!schedule) return undefined;
-    schedule.enabled = !schedule.enabled;
-    this.save();
+    const enabled = !schedule.enabled;
+    this.save(this.schedules.map((item) => (item.id === id ? { ...item, enabled } : item)));
+    schedule.enabled = enabled;
     if (!this.disabled) {
       if (schedule.enabled) {
         this.startJob(schedule);
@@ -371,20 +422,20 @@ export class Scheduler {
     }
     try {
       this.log(`[scheduler] Running agent for: ${schedule.id}`);
-      const result = await agentRunner(schedule.message, schedule.channelId);
+      const result = await agentRunner(schedule.message, schedule.channelId, schedule);
       this.log(`[scheduler] Agent completed: ${schedule.id} (${result.length} chars)`);
     } catch (error) {
       // 一時的なネットワークエラー (DNS 一時失敗・接続タイムアウト等) は
       // バックオフ後に 1 回だけリトライする。エージェント側のタイムアウトや
       // 利用上限はリトライしない (isTransientNetworkError で判別)
-      if (isTransientNetworkError(error)) {
+      if (!isNonRetryableError(error) && isTransientNetworkError(error)) {
         console.warn(
           `[scheduler] Transient network error for ${schedule.id}, retrying in ${TRANSIENT_RETRY_DELAY_MS / 1000}s:`,
           error instanceof Error ? error.message : error
         );
         await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
         try {
-          const result = await agentRunner(schedule.message, schedule.channelId);
+          const result = await agentRunner(schedule.message, schedule.channelId, schedule);
           this.log(`[scheduler] Agent completed on retry: ${schedule.id} (${result.length} chars)`);
           return;
         } catch (retryError) {
@@ -408,21 +459,20 @@ export class Scheduler {
       this.schedules = [];
     }
   }
-  private save(): void {
+  private save(schedules: Schedule[] = this.schedules): void {
+    const tmpPath = `${this.filePath}.tmp`;
     try {
       const dir = dirname(this.filePath);
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-      this.lastSaveTime = Date.now();
       // アトミック書き込み: 一時ファイル → リネーム
-      const tmpPath = `${this.filePath}.tmp`;
-      writeFileSync(tmpPath, JSON.stringify(this.schedules, null, 2), 'utf-8');
+      writeFileSync(tmpPath, JSON.stringify(schedules, null, 2), 'utf-8');
       renameSync(tmpPath, this.filePath);
+      this.lastSaveTime = Date.now();
     } catch (error) {
       console.error('[scheduler] Failed to save schedules:', error);
       // 一時ファイルが残っていたら削除
-      const tmpPath = `${this.filePath}.tmp`;
       try {
         if (existsSync(tmpPath)) {
           unlinkSync(tmpPath);
@@ -430,6 +480,7 @@ export class Scheduler {
       } catch {
         // クリーンアップ失敗は無視
       }
+      throw error;
     }
   }
   private generateId(): string {
@@ -747,8 +798,8 @@ export function parseScheduleInput(input: string): {
       targetChannelId,
     };
   }
-  // "起動時 メッセージ" or "startup メッセージ"
-  const startupMatch = trimmed.match(/^(?:起動時|startup)\s+(.+)$/i);
+  // "起動時 メッセージ", "起動時に メッセージ", or "startup メッセージ"
+  const startupMatch = trimmed.match(/^(?:起動時(?:に)?|startup)\s+(.+)$/i);
   if (startupMatch) {
     return {
       type: 'startup',

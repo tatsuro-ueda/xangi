@@ -1,4 +1,4 @@
-[日本語](../discord-setup.md) | **English**
+[日本語](../discord-setup.md) | English
 
 # Discord Bot Setup Guide
 
@@ -28,11 +28,11 @@ Log in with your Discord account.
 
 On the same Bot page, configure **Privileged Gateway Intents**:
 
-| Intent | Required | Description |
-|--------|----------|-------------|
-| Presence Intent | Optional | Retrieve user online status |
-| Server Members Intent | Optional | Retrieve server member info |
-| **Message Content Intent** | **Required** | Read message content |
+| Intent                     | Required     | Description                 |
+| -------------------------- | ------------ | --------------------------- |
+| Presence Intent            | Optional     | Retrieve user online status |
+| Server Members Intent      | Optional     | Retrieve server member info |
+| **Message Content Intent** | **Required** | Read message content        |
 
 **Warning: The bot cannot read messages unless Message Content Intent is turned ON!**
 
@@ -45,26 +45,27 @@ On the same Bot page, configure **Privileged Gateway Intents**:
 3. Under **BOT PERMISSIONS**, select:
    - Send Messages
    - Send Messages in Threads
+   - Manage Threads (required when using the thread `Close` button to remove the user who clicked it)
    - Read Message History
+   - Attach Files (required to send generated files)
    - Add Reactions
    - Use Slash Commands
 4. Copy the generated URL
 5. Open the URL in your browser and select the server to invite the bot to
 
-## 6. Set Environment Variables
+## 6. Set the token
 
 ```bash
-# Edit .env
-cp .env.example .env
-vim .env
+xangi settings
 ```
 
-```bash
-# Discord Bot Token
-DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE
+Paste the Bot token into the Discord field on the local settings page and save it. You do not need to paste the token into an AI conversation or `.env`.
 
+In a source checkout, non-secret advanced settings such as allowed user IDs can still be placed in `.env`:
+
+```bash
 # Allowed user ID (single user only)
-ALLOWED_USER=YOUR_DISCORD_USER_ID
+DISCORD_ALLOWED_USER=YOUR_DISCORD_USER_ID
 ```
 
 ## 7. Verify It Works
@@ -74,13 +75,14 @@ ALLOWED_USER=YOUR_DISCORD_USER_ID
 npm run build
 
 # Start with Docker
-docker compose up -d --build
+docker compose up xangi -d --build
 
 # Check logs
-docker logs -f xangi
+docker compose logs -f xangi
 ```
 
-Try `/new` or `/skills` in your Discord server, or mention the bot:
+Try `/new` or `/skill` in your Discord server, or mention the bot:
+
 ```
 @xangi Hello!
 ```
@@ -105,7 +107,7 @@ Try `/new` or `/skills` in your Discord server, or mention the bot:
 
 1. Verify that **Message Content Intent** is ON
 2. Verify the bot has been invited to the server
-3. Verify `ALLOWED_USER` is set correctly
+3. Verify `DISCORD_ALLOWED_USER` is set correctly
 
 ### Slash Commands Don't Appear
 
@@ -115,10 +117,14 @@ Try `/new` or `/skills` in your Discord server, or mention the bot:
 
 ### "Discord token not configured" Error
 
-The `DISCORD_TOKEN` in `.env` is empty. Set the token.
+Open `xangi settings` and confirm that Discord is marked as configured.
+
+### The thread `Close` button does not remove the user
+
+Enable Manage Threads for the bot role or the target channel. Without it, the Discord API returns `Missing Access` or `Missing Permissions`.
 
 ## Security Notes
 
-- **Never commit tokens to Git** (`.env` is already in `.gitignore`)
+- **Never paste tokens into Git or an AI conversation**
 - **Never expose tokens publicly** (regenerate immediately if leaked)
-- `ALLOWED_USER` restricts usage to a single user (in compliance with Claude Code Terms of Service)
+- `DISCORD_ALLOWED_USER` restricts usage to a single user (in compliance with Claude Code Terms of Service)

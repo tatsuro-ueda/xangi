@@ -16,8 +16,14 @@ import {
   createSession,
   createWebSession,
   setProviderSessionId,
+  setProviderSessionMode,
   listAllSessions,
+  hasSessionGoneIdle,
+  updateSessionProject,
+  updateSessionTitle,
   WEB_CHAT_CONTEXT_PREFIX,
+  closeSession,
+  getSessionLifecycle,
 } from '../src/sessions.js';
 
 describe('sessions', () => {
@@ -86,21 +92,63 @@ describe('sessions', () => {
       expect(getSession('channel-1')).toBe('session-abc');
     });
 
+    it('repairs lone surrogates in persisted session titles', () => {
+      const sessionsPath = join(testDir, 'sessions.json');
+      const appId = 'invalid_title_001';
+      const data = {
+        activeByContext: { 'channel-1': appId },
+        sessions: {
+          [appId]: {
+            id: appId,
+            title: 'broken\uD83D',
+            platform: 'discord',
+            contextKey: 'channel-1',
+            scope: 'interactive',
+            bootId: 'boot-old',
+            createdAt: '2026-03-18T00:00:00Z',
+            updatedAt: '2026-03-18T00:00:00Z',
+            messageCount: 0,
+            archived: false,
+          },
+        },
+      };
+      require('fs').writeFileSync(sessionsPath, JSON.stringify(data));
+
+      initSessions(testDir);
+
+      expect(getSessionEntry(appId)?.title).toBe('broken');
+      expect(readFileSync(sessionsPath, 'utf-8')).not.toContain('\\ud83d');
+    });
+
     it('should purge scheduler sessions on init', () => {
       const sessionsPath = join(testDir, 'sessions.json');
       const data = {
         activeByContext: { 'channel-1': 'app1', 'channel-2': 'app2' },
         sessions: {
           app1: {
-            id: 'app1', title: '', platform: 'discord', contextKey: 'channel-1',
-            scope: 'interactive', bootId: 'boot-old', createdAt: '2026-03-18T00:00:00Z',
-            updatedAt: '2026-03-18T00:00:00Z', messageCount: 0, archived: false,
+            id: 'app1',
+            title: '',
+            platform: 'discord',
+            contextKey: 'channel-1',
+            scope: 'interactive',
+            bootId: 'boot-old',
+            createdAt: '2026-03-18T00:00:00Z',
+            updatedAt: '2026-03-18T00:00:00Z',
+            messageCount: 0,
+            archived: false,
             agent: { backend: 'claude-code', providerSessionId: 'session-abc' },
           },
           app2: {
-            id: 'app2', title: '', platform: 'discord', contextKey: 'channel-2',
-            scope: 'scheduler', bootId: 'boot-old', createdAt: '2026-03-18T00:00:00Z',
-            updatedAt: '2026-03-18T00:00:00Z', messageCount: 0, archived: false,
+            id: 'app2',
+            title: '',
+            platform: 'discord',
+            contextKey: 'channel-2',
+            scope: 'scheduler',
+            bootId: 'boot-old',
+            createdAt: '2026-03-18T00:00:00Z',
+            updatedAt: '2026-03-18T00:00:00Z',
+            messageCount: 0,
+            archived: false,
             agent: { backend: 'claude-code', providerSessionId: 'session-def' },
           },
         },
@@ -189,6 +237,40 @@ describe('sessions', () => {
     });
   });
 
+  describe('closeSession', () => {
+    it('marks the session closed, detaches routing, and keeps the session record', () => {
+      initSessions(testDir);
+      const appId = createSession('channel-close', { platform: 'discord' });
+
+      expect(getSessionLifecycle(appId)).toBe('open');
+      expect(closeSession(appId, 'monitor')).toBe(true);
+
+      expect(getActiveSessionId('channel-close')).toBeUndefined();
+      expect(getSessionEntry(appId)).toMatchObject({
+        id: appId,
+        lifecycle: 'closed',
+        closeReason: 'monitor',
+      });
+      expect(getSessionEntry(appId)?.closedAt).toBeTruthy();
+      expect(getSessionLifecycle(appId)).toBe('closed');
+    });
+
+    it('treats existing entries without lifecycle as closed', () => {
+      initSessions(testDir);
+      const openId = createSession('channel-open');
+      const closedId = createSession('channel-detached');
+      deleteSession('channel-detached');
+
+      const openEntry = getSessionEntry(openId)!;
+      const closedEntry = getSessionEntry(closedId)!;
+      delete openEntry.lifecycle;
+      delete closedEntry.lifecycle;
+
+      expect(getSessionLifecycle(openId)).toBe('closed');
+      expect(getSessionLifecycle(closedId)).toBe('closed');
+    });
+  });
+
   describe('ensureSession', () => {
     it('should create new session if none exists', () => {
       initSessions(testDir);
@@ -202,6 +284,18 @@ describe('sessions', () => {
       const id1 = ensureSession('channel-1');
       const id2 = ensureSession('channel-1');
       expect(id1).toBe(id2);
+    });
+
+    it('marks a legacy active session open when it receives a new input', () => {
+      initSessions(testDir);
+      const id = createSession('legacy-channel');
+      const entry = getSessionEntry(id)!;
+      delete entry.lifecycle;
+
+      expect(getSessionLifecycle(id)).toBe('closed');
+      expect(ensureSession('legacy-channel')).toBe(id);
+      expect(getSessionEntry(id)?.lifecycle).toBe('open');
+      expect(getSessionLifecycle(id)).toBe('open');
     });
   });
 
@@ -217,6 +311,21 @@ describe('sessions', () => {
     });
   });
 
+  describe('session title persistence', () => {
+    it('sanitizes titles on create and update', () => {
+      initSessions(testDir);
+      const appId = createSession('channel-unicode', { title: 'create\uD83D📎' });
+      expect(getSessionEntry(appId)?.title).toBe('create📎');
+
+      updateSessionTitle(appId, 'update\uDCCE📎');
+      expect(getSessionEntry(appId)?.title).toBe('update📎');
+
+      const saved = readFileSync(join(testDir, 'sessions.json'), 'utf-8');
+      expect(saved).not.toContain('\\ud83d');
+      expect(saved).not.toContain('\\udcce');
+    });
+  });
+
   describe('setProviderSessionId', () => {
     it('should set providerSessionId on existing session', () => {
       initSessions(testDir);
@@ -225,6 +334,48 @@ describe('sessions', () => {
       const entry = getSessionEntry(appId);
       expect(entry!.agent?.providerSessionId).toBe('provider-abc');
       expect(entry!.agent?.backend).toBe('claude-code');
+    });
+
+    it('persists resolved model and effort across provider session updates', () => {
+      initSessions(testDir);
+      const appId = createSession('channel-1');
+      setProviderSessionId(appId, 'provider-abc', 'codex', 'gpt-5.6', 'high');
+      setProviderSessionId(appId, 'provider-def');
+
+      expect(getSessionEntry(appId)?.agent).toEqual({
+        backend: 'codex',
+        model: 'gpt-5.6',
+        effort: 'high',
+        providerSessionId: 'provider-def',
+      });
+    });
+
+    it('persists stateless provider metadata across later session updates', () => {
+      initSessions(testDir);
+      const appId = createSession('channel-1');
+      setProviderSessionId(
+        appId,
+        'search:channel-1',
+        'workspace-search',
+        undefined,
+        undefined,
+        'stateless'
+      );
+      setProviderSessionId(appId, 'search:channel-1');
+
+      expect(getSessionEntry(appId)?.agent?.sessionMode).toBe('stateless');
+    });
+
+    it('records provider session mode before a provider session ID exists', () => {
+      initSessions(testDir);
+      const appId = createSession('channel-1');
+
+      setProviderSessionMode(appId, 'workspace-search', 'stateless');
+
+      expect(getSessionEntry(appId)?.agent).toMatchObject({
+        backend: 'workspace-search',
+        sessionMode: 'stateless',
+      });
     });
   });
 
@@ -251,6 +402,36 @@ describe('sessions', () => {
       expect(getActiveSessionId(entryA.contextKey)).toBe(a);
       expect(getActiveSessionId(entryB.contextKey)).toBe(b);
       expect(entryB.title).toBe('second');
+    });
+
+    it('stores an optional logical Web Project without changing the context key', () => {
+      initSessions(testDir);
+      const appId = createWebSession({ projectId: 'project-1' });
+      const entry = getSessionEntry(appId)!;
+
+      expect(entry.projectId).toBe('project-1');
+      expect(entry.contextKey).toBe(`${WEB_CHAT_CONTEXT_PREFIX}${appId}`);
+    });
+
+    it('moves an existing Web session into and out of a Project', () => {
+      initSessions(testDir);
+      const appId = createWebSession({});
+
+      expect(updateSessionProject(appId, 'project-1')).toBe(true);
+      expect(getSessionEntry(appId)?.projectId).toBe('project-1');
+      expect(updateSessionProject(appId)).toBe(true);
+      expect(getSessionEntry(appId)?.projectId).toBeUndefined();
+
+      clearSessions();
+      initSessions(testDir);
+      expect(getSessionEntry(appId)?.projectId).toBeUndefined();
+    });
+
+    it('does not move a non-Web session into a Project', () => {
+      initSessions(testDir);
+      const appId = createSession('discord-1', { platform: 'discord' });
+      expect(updateSessionProject(appId, 'project-1')).toBe(false);
+      expect(getSessionEntry(appId)?.projectId).toBeUndefined();
     });
   });
 
@@ -422,5 +603,23 @@ describe('sessions', () => {
         if (prev !== undefined) process.env.XANGI_SESSION_RETENTION_DAYS = prev;
       }
     });
+  });
+});
+
+describe('hasSessionGoneIdle', () => {
+  const now = Date.parse('2026-05-23T12:00:00.000Z');
+  const fourHoursMs = 4 * 3600 * 1000;
+
+  it('returns true at or beyond the idle threshold', () => {
+    expect(hasSessionGoneIdle(new Date(now - fourHoursMs).toISOString(), fourHoursMs, now)).toBe(
+      true
+    );
+  });
+
+  it('returns false before the threshold or for invalid inputs', () => {
+    expect(hasSessionGoneIdle(new Date(now - 1000).toISOString(), fourHoursMs, now)).toBe(false);
+    expect(hasSessionGoneIdle(undefined, fourHoursMs, now)).toBe(false);
+    expect(hasSessionGoneIdle('not-a-date', fourHoursMs, now)).toBe(false);
+    expect(hasSessionGoneIdle(new Date(0).toISOString(), 0, now)).toBe(false);
   });
 });

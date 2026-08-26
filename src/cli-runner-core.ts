@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { spawn, ChildProcess } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import type {
   AgentRunner,
   RunOptions,
@@ -13,6 +14,7 @@ import { TimeoutController } from './timeout-controller.js';
 import { buildCliEnv, clearManagedCliProcess, registerManagedCliProcess } from './cli-process.js';
 import { appendJsonlChunk, flushJsonlBuffer } from './jsonl-buffer.js';
 import type { BaseRunnerOptions } from './base-runner.js';
+import { configuredBackendCommand } from './setup/backend-executable.js';
 
 /**
  * JSONL ストリームをランナー固有のイベント解釈に変換するパーサ。
@@ -26,11 +28,16 @@ export interface CliStreamParser {
    * 即 reject する。flush 中に返した Error は無視される。
    * パーサ側からは callbacks.onError を直接呼ばないこと（二重通知になる）。
    */
-  handleEvent(json: unknown, phase: 'stream' | 'flush'): Error | undefined | void;
+  /** false を返すと、その行を handleRawLine に渡す */
+  handleEvent(json: unknown, phase: 'stream' | 'flush'): Error | false | undefined | void;
+  /** JSON ではない行を扱う必要があるランナー向け（旧 CLI のプレーン出力など） */
+  handleRawLine?(line: string, phase: 'stream' | 'flush'): void;
   /** 正常終了時の結果テキストとセッション ID を返す */
   finalize(): { result: string; sessionId: string };
   /** exit code != 0 のとき、エラーメッセージに添える詳細（CLI の error イベント本文など） */
   exitErrorDetail?(): string | undefined;
+  /** exit code != 0 のエラーへ、ランナー固有の状態を引き継ぐ */
+  wrapExitError?(error: Error): Error;
 }
 
 export interface ExecuteStreamOptions {
@@ -48,6 +55,10 @@ export interface ExecuteStreamOptions {
 export interface CollectOutputOptions {
   /** exit code != 0 のとき stdout 全文からエラー詳細を抽出する（CLI の error イベント本文など） */
   exitErrorDetail?: (stdout: string) => string | undefined;
+  /** 指定時のみ、Node.js の連続デコーダで stdout / stderr を文字列化する */
+  encoding?: BufferEncoding;
+  /** exit code に関わらず stderr 全文を呼び出し元へ渡す */
+  onStderr?: (stderr: string) => void;
 }
 
 /**
@@ -63,6 +74,7 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
   protected readonly timeoutMs: number;
   protected readonly workdir?: string;
   protected readonly skipPermissions: boolean;
+  private readonly platform?: BaseRunnerOptions['platform'];
   protected currentProcess: ChildProcess | null = null;
   /** チャンネル別タイムアウト管理（UI の延長 / 残り表示 / 自動 kill 連動） */
   protected readonly timeoutController: TimeoutController;
@@ -82,6 +94,7 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.workdir = options?.workdir;
     this.skipPermissions = options?.skipPermissions ?? false;
+    this.platform = options?.platform;
     this.timeoutController = new TimeoutController({ baseTimeoutMs: this.timeoutMs });
     for (const evt of ['timeout-started', 'timeout-extended', 'timeout-cleared'] as const) {
       this.timeoutController.on(evt, (payload) => this.emit(evt, payload));
@@ -100,7 +113,7 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
 
   /** 子プロセス用の環境変数（runner 固有の追加があれば override） */
   protected buildEnv(channelId?: string): NodeJS.ProcessEnv {
-    return buildCliEnv(channelId);
+    return buildCliEnv(channelId, this.platform, this.workdir);
   }
 
   protected logExecution(kind: 'Executing' | 'Streaming', options?: RunOptions): void {
@@ -165,10 +178,11 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
     opts: CollectOutputOptions = {}
   ): Promise<string> {
     return new Promise((resolve, reject) => {
-      const proc = spawn(this.command, args, {
+      const env = this.buildEnv(channelId);
+      const proc = spawn(configuredBackendCommand(this.command, env), args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: this.buildEnv(channelId),
+        env,
       });
       this.currentProcess = proc;
       registerManagedCliProcess(channelId, proc, this.activeProcesses, this.timeoutController);
@@ -176,6 +190,11 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
 
       let stdout = '';
       let stderr = '';
+
+      if (opts.encoding) {
+        proc.stdout?.setEncoding(opts.encoding);
+        proc.stderr?.setEncoding(opts.encoding);
+      }
 
       proc.stdout?.on('data', (data) => {
         stdout += data.toString();
@@ -187,6 +206,7 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
 
       proc.on('close', (code) => {
         this.finishProcess(proc, channelId, fallbackTimer, code === 0 ? 'completed' : 'error');
+        opts.onStderr?.(stderr);
 
         if (code !== 0) {
           reject(this.buildExitError(code, opts.exitErrorDetail?.(stdout), stderr));
@@ -214,10 +234,11 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
   ): Promise<RunResult> {
     return new Promise((resolve, reject) => {
       const parser = this.createStreamParser(callbacks);
-      const proc = spawn(this.command, args, {
+      const env = this.buildEnv(opts.channelId);
+      const proc = spawn(configuredBackendCommand(this.command, env), args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: this.buildEnv(opts.channelId),
+        env,
       });
       this.currentProcess = proc;
       registerManagedCliProcess(opts.channelId, proc, this.activeProcesses, this.timeoutController);
@@ -225,6 +246,8 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       let buffer = '';
       let stderr = '';
       let fatalError: Error | null = null;
+      const stdoutDecoder = new StringDecoder('utf8');
+      const stderrDecoder = new StringDecoder('utf8');
 
       const notifyError = (error: Error) => {
         if (opts.notifyOnError !== false) {
@@ -243,9 +266,14 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
         try {
           json = JSON.parse(line);
         } catch {
-          return; // JSONパースエラーは無視
+          parser.handleRawLine?.(line, phase);
+          return;
         }
         const result = parser.handleEvent(json, phase);
+        if (result === false) {
+          parser.handleRawLine?.(line, phase);
+          return;
+        }
         if (result instanceof Error && phase === 'stream') {
           fatalError = result;
           notifyError(result);
@@ -254,7 +282,8 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       };
 
       proc.stdout?.on('data', (data) => {
-        const parsed = appendJsonlChunk(buffer, data.toString());
+        const chunk = typeof data === 'string' ? data : stdoutDecoder.write(data);
+        const parsed = appendJsonlChunk(buffer, chunk);
         buffer = parsed.buffer;
         for (const line of parsed.lines) {
           processLine(line, 'stream');
@@ -262,13 +291,23 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       });
 
       proc.stderr?.on('data', (data) => {
-        const chunk = data.toString();
+        const chunk = typeof data === 'string' ? data : stderrDecoder.write(data);
         stderr += chunk;
         console.error(`[${this.logPrefix}] stderr:`, chunk);
       });
 
       proc.on('close', (code) => {
         this.finishProcess(proc, opts.channelId, fallbackTimer, code === 0 ? 'completed' : 'error');
+
+        const stdoutTail = stdoutDecoder.end();
+        if (stdoutTail) {
+          const parsed = appendJsonlChunk(buffer, stdoutTail);
+          buffer = parsed.buffer;
+          for (const line of parsed.lines) {
+            processLine(line, 'flush');
+          }
+        }
+        stderr += stderrDecoder.end();
 
         // 残りのバッファを処理
         for (const line of flushJsonlBuffer(buffer)) {
@@ -278,13 +317,23 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
         if (fatalError) return; // 既に reject 済み
 
         if (code !== 0) {
-          const error = this.buildExitError(code, parser.exitErrorDetail?.(), stderr);
+          const exitError = this.buildExitError(code, parser.exitErrorDetail?.(), stderr);
+          const error = parser.wrapExitError?.(exitError) ?? exitError;
           notifyError(error);
           reject(error);
           return;
         }
 
-        const { result, sessionId } = parser.finalize();
+        let result: string;
+        let sessionId: string;
+        try {
+          ({ result, sessionId } = parser.finalize());
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          notifyError(err);
+          reject(err);
+          return;
+        }
         const runResult: RunResult = { result, sessionId };
         opts.onComplete?.(runResult);
         callbacks.onComplete?.(runResult);

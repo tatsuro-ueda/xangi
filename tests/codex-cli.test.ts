@@ -53,7 +53,11 @@ describe('CodexRunner buildArgs', () => {
   async function getSpawnArgs(
     runner: CodexRunner,
     prompt: string,
-    options?: { sessionId?: string; skipPermissions?: boolean }
+    options?: {
+      sessionId?: string;
+      skipPermissions?: boolean;
+      effort?: 'low' | 'medium' | 'high' | 'max';
+    }
   ) {
     const { spawn, getMockProcess } = await import('child_process');
 
@@ -113,6 +117,28 @@ describe('CodexRunner buildArgs', () => {
     const modelIndex = args.indexOf('--model');
     expect(modelIndex).toBeGreaterThan(-1);
     expect(args[modelIndex + 1]).toBe('o3');
+  });
+
+  it('should pass effort as model_reasoning_effort config', async () => {
+    const runner = new CodexRunner({});
+    const { args } = await getSpawnArgs(runner, 'hello', { effort: 'max' });
+
+    const configIndex = args.indexOf('--config');
+    expect(configIndex).toBeGreaterThan(-1);
+    expect(args[configIndex + 1]).toBe('model_reasoning_effort="max"');
+  });
+
+  it('should place effort config before resume subcommand', async () => {
+    const runner = new CodexRunner({});
+    const { args } = await getSpawnArgs(runner, 'hello', {
+      sessionId: 'abc-123',
+      effort: 'high',
+    });
+
+    const configIndex = args.indexOf('--config');
+    const resumeIndex = args.indexOf('resume');
+    expect(configIndex).toBeLessThan(resumeIndex);
+    expect(args[configIndex + 1]).toBe('model_reasoning_effort="high"');
   });
 
   it('should include --cd when workdir is set', async () => {
@@ -419,5 +445,97 @@ describe('CodexRunner エラー本文の救出', () => {
     const result = await promise;
     expect(result.result).toBe('done');
     expect(tools).toEqual([{ name: 'Bash', input: { command: '/bin/bash -lc pwd' } }]);
+  });
+
+  it('runStream: trace callback receives timing-safe tool and usage metadata', async () => {
+    const runner = new CodexRunner({});
+    const trace: unknown[] = [];
+    const promise = runner.runStream('hi', {
+      onTraceEvent: (event) => trace.push(event),
+    });
+
+    await emitEventsThenClose(
+      [
+        { type: 'thread.started', thread_id: 'thread-1' },
+        { type: 'turn.started' },
+        {
+          type: 'item.started',
+          item: {
+            id: 'item_0',
+            type: 'command_execution',
+            command: '/bin/bash -lc pwd',
+            status: 'in_progress',
+          },
+        },
+        {
+          type: 'item.completed',
+          item: {
+            id: 'item_0',
+            type: 'command_execution',
+            command: '/bin/bash -lc pwd',
+            aggregated_output: '/tmp\n',
+            exit_code: 0,
+            status: 'completed',
+          },
+        },
+        { type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: 'done' } },
+        {
+          type: 'turn.completed',
+          usage: { input_tokens: 120, cached_input_tokens: 100, output_tokens: 12 },
+        },
+      ],
+      0
+    );
+    await promise;
+
+    expect(trace).toEqual([
+      { type: 'turn_started' },
+      { type: 'tool_started', toolId: 'item_0', toolName: 'Bash' },
+      {
+        type: 'tool_completed',
+        toolId: 'item_0',
+        toolName: 'Bash',
+        status: 'completed',
+        exitCode: 0,
+        outputBytes: 5,
+      },
+      { type: 'message_completed' },
+      {
+        type: 'turn_completed',
+        usage: { inputTokens: 120, cachedInputTokens: 100, outputTokens: 12 },
+      },
+    ]);
+    expect(JSON.stringify(trace)).not.toContain('/bin/bash');
+    expect(JSON.stringify(trace)).not.toContain('/tmp');
+  });
+
+  it('runStream: 改行なしの最終イベントも trace callback に流す', async () => {
+    const runner = new CodexRunner({});
+    const trace: unknown[] = [];
+    const promise = runner.runStream('hi', {
+      onTraceEvent: (event) => trace.push(event),
+    });
+
+    const { getMockProcess } = await import('child_process');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const mockProcess = (getMockProcess as () => any)();
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'done' } }) +
+          '\n' +
+          JSON.stringify({
+            type: 'turn.completed',
+            usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 2 },
+          })
+      )
+    );
+    mockProcess.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({ result: 'done', sessionId: '' });
+    expect(trace).toContainEqual({
+      type: 'turn_completed',
+      usage: { inputTokens: 10, cachedInputTokens: 4, outputTokens: 2 },
+    });
   });
 });

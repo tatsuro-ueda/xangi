@@ -1,194 +1,156 @@
-[日本語](README.md) | **English**
+[日本語](README.md) | English
 
 # xangi
 
-> **A**I **N**EON **G**ENESIS **I**NTELLIGENCE
+[![CI Build](https://github.com/karaage0703/xangi/actions/workflows/ci.yml/badge.svg)](https://github.com/karaage0703/xangi/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/karaage0703/xangi)](https://github.com/karaage0703/xangi/releases)
+[![License](https://img.shields.io/github/license/karaage0703/xangi)](LICENSE)
 
-An AI assistant for Discord / Slack / browser / LINE, powered by Claude Code / Codex / Cursor CLI / Grok CLI / Local LLM backends. Discord recommended; browser-only mode also supported.
+> **A**GENTIC **N**EON **G**ENESIS **I**NTELLIGENCE
 
-## Features
+xangi is an AI assistant that connects Claude Code, Codex, OpenCode, Cursor CLI, Grok CLI, Antigravity CLI, GitHub Copilot CLI, or a Local LLM to Discord, Slack, Telegram, Web Chat, and LINE. Discord is recommended, but xangi can also run with only a browser.
 
-- Discord / Slack / Web Chat UI / LINE support
-- Claude Code / Codex / Cursor CLI / Grok CLI / Local LLM support
-- Per-channel backend / model / effort switching with `/backend`
-- Skills, scheduler, and event triggers
-- Docker, pm2, and auto-restart support
-- Session persistence, timeout extension, and workspace hooks
+## Key features
+
+- Six AI backends and five chat surfaces
+- Per-channel backend, model, effort, and Local LLM reasoning-effort settings with dynamic model discovery
+- Immediate, restart-free updates to allowed channel settings through natural language or native commands
+- Run workspace skills directly from chat
+- Persistent sessions and transcripts, timeout extension, and workspace hooks
+- Scheduler and event-triggered agent turns
+- Browse and edit workspace Markdown and code from Web Chat
+- Organize and move conversations with logical Web Projects, optional extra prompts, and per-Project default models
+- [External extension integration](docs/en/usage.md#extension-integration) through the Web UI
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    User([User]) <-->|Message| chat[UI<br/>Discord / Slack<br/>Browser / LINE]
-    chat <-->|Prompt| xangi[xangi]
-    xangi <-->|Execute| LLM{{LLM Backend<br/>Claude Code / Codex<br/>Cursor CLI / Grok CLI<br/>Local LLM}}
-    LLM <-->|File ops| WS[(Workspace<br/>AGENTS.md / skills<br/>Local docs)]
-    LLM <--> Web[Web Search]
-    LLM <--> Service[Web Service]
-    xangi -->|Scheduled| Scheduler
-    Scheduler -->|Prompt| LLM
+    User([User]) <-->|Message| Platform[Chat Platforms]
+    Platform <-->|Prompt / Response| xangi[xangi]
+    xangi <-->|Execute| Backend{{Agent Backends}}
+    Backend <-->|Read / Write| WS[(Workspace)]
+    Backend <--> External[External Knowledge / Web Services]
+    Scheduler[[Scheduler / Event Trigger]] -->|Prompt| xangi
 
     classDef user fill:#fef3c7,stroke:#d97706,color:#111;
     classDef core fill:#dbeafe,stroke:#1e40af,color:#111;
     classDef ws fill:#fef9c3,stroke:#a16207,color:#111;
     classDef ext fill:#f3f4f6,stroke:#6b7280,color:#111;
     class User user;
-    class chat,xangi,LLM,Scheduler core;
+    class Platform,xangi,Backend,Scheduler core;
     class WS ws;
-    class Web,Service ext;
+    class External ext;
 ```
 
-## Quick Start
+## Quickstart
 
-### 1. Configure environment variables
+The same flow works on macOS, Linux, and WSL2.
+
+1. Prepare one supported AI tool. This example uses Codex.
+
+   ```bash
+   bash <(curl -fsSL https://github.com/karaage0703/xangi/releases/latest/download/setup-ai-tools.sh) codex
+   ```
+
+   Replace `codex` with `claude-code`, `cursor`, `grok`, `antigravity`, `github-copilot`, or `opencode` if needed.
+
+2. Install xangi.
+
+   ```bash
+   curl -fsSL https://github.com/karaage0703/xangi/releases/latest/download/install.sh | bash
+   ```
+
+3. Open a new terminal and start guided setup.
+
+   ```bash
+   xangi setup
+   ```
+
+The guided setup currently communicates in Japanese. It lets you choose the workspace and AI backend, then starts and verifies Web Chat locally first. Tailscale and LAN exposure are optional settings offered only after the local setup works. If setup stops or you are unsure about the current state, run:
+
+```bash
+xangi doctor
+```
+
+See the [usage guide](docs/en/usage.md#first-install-without-git) for installation, updates, removal, and configuration paths.
+
+## Start using xangi
+
+- Web Chat: initially open `http://127.0.0.1:18888`
+- Discord, Slack, Telegram, or LINE: message the configured bot
+- Health check: `xangi doctor`
+- Web UI URLs and reachability: `xangi tool web_status`
+- Version check: `xangi --version`
+- Connection settings: `xangi settings`
+- If the service was not started during setup: `xangi service start`
+
+The [usage guide](docs/en/usage.md) covers chat commands, the terminal CLI, scheduling, Docker, Local LLMs, and environment variables.
+
+## Platform setup
+
+- [Discord](docs/en/discord-setup.md)
+- [Slack](docs/en/slack-setup.md)
+- [Telegram](docs/en/telegram-setup.md)
+- [LINE](docs/en/line-setup.md)
+- Web Chat is configured directly by `xangi setup`
+
+## Develop from source
+
+This section is for xangi contributors. Source builds require Node.js 22 or later, npm, and the AI CLI you intend to use.
 
 ```bash
 cp .env.example .env
-```
-
-**Minimum required settings (.env):**
-```bash
-# Discord Bot Token (required)
-DISCORD_TOKEN=your_discord_bot_token
-
-# Allowed user ID (required, comma-separated for multiple, "*" for all)
-DISCORD_ALLOWED_USER=123456789012345678
-```
-
-> 💡 The working directory defaults to `./workspace`. Set `WORKSPACE_PATH` to change it.
-
-> 💡 See [Discord Setup](docs/en/discord-setup.md) for how to create a Bot and find IDs.
-
-### 2. Build & Run
-
-```bash
-# Requires Node.js 22+ and at least one AI CLI
-# Claude Code: curl -fsSL https://claude.ai/install.sh | bash
-# Codex CLI:   npm install -g @openai/codex
-# Cursor CLI:  curl https://cursor.com/install -fsS | bash
-# Grok CLI:    curl -fsSL https://x.ai/cli/install.sh | bash
-# Local LLM:   Install Ollama (https://ollama.com)
-
-npm install
+npm ci
 npm run build
 npm start
-
-# Development
-npm run dev
 ```
 
-### 3. Verify
+For Discord, set `DISCORD_TOKEN` and `DISCORD_ALLOWED_USER` in `.env`. For Web Chat only, set `WEB_CHAT_ENABLED=true`. A source checkout uses the process startup directory as its default workspace; set `WORKSPACE_PATH` when you need a different directory.
 
-Mention the bot in Discord to start a conversation.
+Use `npm run dev` during development. The validation commands are `npm test`, `npm run typecheck`, `npm run lint`, and `npm run format:check`. See the [usage guide](docs/en/usage.md) for PM2, multiple instances, and key environment variables, and [.env.example](.env.example) for an annotated configuration sample.
 
-### Browser-only (no Discord/Slack)
-
-If you don't want to set up tokens or just want to use it via a local browser, the Web Chat UI can run standalone.
-
-Add to `.env`:
-
-```bash
-WEB_CHAT_ENABLED=true
-```
-
-```bash
-npm start
-```
-
-Open `http://localhost:18888` in your browser.
-
-> 💡 The Web Chat UI is opt-in (`WEB_CHAT_ENABLED=true`) to avoid surprise port conflicts. Change the port with `WEB_CHAT_PORT`.
-> 💡 See [Slack Setup](docs/en/slack-setup.md) for Slack integration.
-
-### Auto-restart (pm2)
-
-xangi supports `/restart` command. A process manager is required for auto-recovery.
-
-```bash
-npm install -g pm2
-pm2 start "npm start" --name xangi
-pm2 restart xangi  # Manual restart
-pm2 logs xangi     # View logs
-```
-
-## Usage
-
-### Basics
-- `@xangi your question` - Mention to interact
-- No mention needed in dedicated channels
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `/new` | Start a new session |
-| `/stop` | Stop running task |
-| `/settings` | Show current settings |
-| `/notify` | Configure completion notifications for this channel |
-| `/backend` | Per-channel backend / model switching |
-| `xangi-cmd schedule_*` | Scheduler (cron / reminders) |
-| `xangi-cmd discord_*` | Discord operations (history / send / search, etc.) |
-| `xangi-cmd trigger` | Event trigger (start an agent turn when a job finishes) |
-
-Response messages include buttons (Stop / New Session). Set `DISCORD_SHOW_BUTTONS=false` to hide.
-
-See [Usage Guide](docs/en/usage.md) for details.
-
-## Running with Docker
-
-Docker containers are available for isolated execution.
+To use Docker:
 
 ```bash
 # Claude Code backend
 docker compose up xangi -d --build
 
-# Local LLM backend (Ollama)
+# Full image (also set AGENT_BACKEND=local-llm in .env to use a local model)
 docker compose up xangi-max -d --build
 
-# GPU version (CUDA + Python + PyTorch)
+# GPU image with CUDA and PyTorch
 docker compose up xangi-gpu -d --build
 ```
 
-See [Usage Guide: Docker](docs/en/usage.md#docker-deployment) for details.
+See [Docker deployment](docs/en/usage.md#docker-deployment) for details.
 
-## Environment Variables
+## Security
 
-### Required (when using Discord)
-
-| Variable | Description |
-|----------|-------------|
-| `DISCORD_TOKEN` | Discord Bot Token |
-| `DISCORD_ALLOWED_USER` | Allowed user IDs (comma-separated, `*` for all) |
-
-For browser-only operation, just set `WEB_CHAT_ENABLED=true` (no Discord token required).
-
-See [Usage Guide](docs/en/usage.md#environment-variables-reference) for all environment variables.
+- Web Chat has no application-level authentication. LAN access exposes workspace browsing and editing to the same network scope. Prefer local access or Tailscale.
+- `xangi settings` binds temporarily to `127.0.0.1` and never sends stored tokens back to the browser.
+- Do not paste external-service tokens into AI conversations or shell history.
 
 ## Workspace
 
-Recommended workspace: [ai-assistant-workspace](https://github.com/karaage0703/ai-assistant-workspace)
+[ai-assistant-workspace](https://github.com/karaage0703/ai-assistant-workspace) is an optional starter kit with skills for notes, diaries, transcription, Notion integration, and more.
 
-A starter kit with pre-configured skills (note-taking, diary, transcription, Notion integration, etc.). Combine with xangi to automate daily tasks from chat.
+## Related projects
 
-## Related Projects
-
-- [xangi-stackchan](https://github.com/karaage0703/xangi-stackchan) - A resident bridge that makes a Stack-chan (M5Stack) speak xangi's responses with facial expressions and head movement, by subscribing to the [external event stream](docs/en/events.md) (SSE)
-
-## Book
-
-📖 [生活に溶け込むAI — Build Your Own AI Assistant with AI Agents](https://karaage0703.booth.pm/items/8027277) (Japanese)
-
-A book about building AI assistants with xangi.
+- [xangi-stackchan](https://github.com/karaage0703/xangi-stackchan) - Bridge xangi responses to an expressive M5Stack character
+- [xangi-even-g2](https://github.com/karaage0703/xangi-even-g2) - Even Hub app and bridge for using xangi from Even Realities G2
+- [xangi-pets](https://github.com/karaage0703/xangi-pets) - Desktop companions that display xangi state and responses
 
 ## Documentation
 
-- [Usage Guide](docs/en/usage.md) - Docker, env vars, Local LLM, troubleshooting
-- [Discord Setup](docs/en/discord-setup.md) - Bot creation & ID lookup
-- [Slack Setup](docs/en/slack-setup.md) - Slack integration
-- [LINE Setup](docs/en/line-setup.md) - LINE Messaging API integration (incl. Tailscale Funnel for public webhook)
-- [Design Document](docs/en/design.md) - Architecture, design philosophy, data flow
-- [External Event Stream](docs/en/events.md) - Response lifecycle event delivery spec
-- [Inter-instance Chat](docs/en/inter-instance-chat.md) - Message exchange & auto-talk between instances
+- [Usage guide](docs/en/usage.md) - Commands, configuration, Docker, Local LLMs, multiple instances, and troubleshooting
+- [Design document](docs/en/design.md) - Architecture, components, and data flow
+- [External event stream](docs/en/events.md) - SSE and device input APIs
+- [Inter-instance chat](docs/en/inter-instance-chat.md) - Messaging between xangi instances
+
+## Book
+
+[生活に溶け込むAI — Build Your Own AI Assistant with AI Agents](https://karaage0703.booth.pm/items/8027277) (Japanese)
 
 ## Acknowledgments
 

@@ -1,4 +1,4 @@
-[日本語](../inter-instance-chat.md) | **English**
+[日本語](../inter-instance-chat.md) | English
 
 # inter-instance-chat — Chat Between xangi Instances
 
@@ -48,17 +48,24 @@ but **be sure to set it explicitly when running multiple instances on the same m
 Each line of `<instanceId>.jsonl`:
 
 ```json
-{"ts":1714912345,"from":"instance-a","from_label":"instance-a","text":"@instance-b おはよ","origin_chain":["user"],"msg_id":"uuid"}
+{
+  "ts": 1714912345,
+  "from": "instance-a",
+  "from_label": "instance-a",
+  "text": "@instance-b おはよ",
+  "origin_chain": ["user"],
+  "msg_id": "uuid"
+}
 ```
 
-| Field | Description |
-|-----------|------|
-| `ts` | Unix seconds |
-| `from` | Sender instance_id |
-| `from_label` | Display name (optional) |
-| `text` | Message body |
+| Field          | Description                                                   |
+| -------------- | ------------------------------------------------------------- |
+| `ts`           | Unix seconds                                                  |
+| `from`         | Sender instance_id                                            |
+| `from_label`   | Display name (optional)                                       |
+| `text`         | Message body                                                  |
 | `origin_chain` | Origin chain. Starts with `user`; each responder appends self |
-| `msg_id` | UUID. Prevents duplicate processing |
+| `msg_id`       | UUID. Prevents duplicate processing                           |
 
 ## Web UI
 
@@ -79,21 +86,21 @@ When you want to see all instances' messages merged chronologically, the `/inter
 
 ```bash
 # Send
-xangi-cmd inter_chat_send --text "やっほー"
-xangi-cmd inter_chat_send --text "@instance-a おはよ" --from-label "my-instance"
+xangi tool inter_chat_send --text "やっほー"
+xangi tool inter_chat_send --text "@instance-a おはよ" --from-label "my-instance"
 
 # Get recent messages
-xangi-cmd inter_chat_tail --limit 20
-xangi-cmd inter_chat_tail --ttl 600   # last 10 minutes only
+xangi tool inter_chat_tail --limit 20
+xangi tool inter_chat_tail --ttl 600   # last 10 minutes only
 
 # Physically delete your own file by TTL
-xangi-cmd inter_chat_clear
+xangi tool inter_chat_clear
 
 # List instances in the shared directory
-xangi-cmd inter_chat_list
+xangi tool inter_chat_list
 
 # Show resolved configuration
-xangi-cmd inter_chat_config
+xangi tool inter_chat_config
 ```
 
 The CLI works even with `INTER_INSTANCE_CHAT_ENABLED=false` (the CLI side temporarily treats it as true).
@@ -153,7 +160,7 @@ so it resumes automatically even after restarting xangi.
 The "post to inter-chat at fixed intervals" requirement is covered by **auto-talk mode**.
 The agent reads the recent context and speaks at random intervals, which makes for a more natural conversation than a fixed-time cron.
 
-You can also post canned messages on a schedule by calling `xangi-cmd inter_chat_send --text "..."` directly
+You can also post canned messages on a schedule by calling `xangi tool inter_chat_send --text "..."` directly
 from the OS cron etc. (the CLI can append to the jsonl even when xangi itself is not running).
 
 ## Docker Support
@@ -166,7 +173,7 @@ volumes:
 ```
 
 - A host-direct xangi (pm2) and a Docker-launched xangi **can share the same path even when mixed**
-- The UID difference between `Dockerfile`=`USER node` (UID 1000) and `Dockerfile.standalone`=root is absorbed by `mode 0777`
+- UID differences between Docker-launched xangi and host-direct xangi are absorbed by `mode 0777`
 - `/tmp` being wiped on OS restart matches the volatility requirement (a named volume would not be visible from a host-direct xangi)
 
 ### Mac / Windows Docker Desktop
@@ -186,5 +193,4 @@ On failure it logs a warning and continues (covering the case where another inst
 
 ## Remaining Tasks
 
-- Unify the UID across Docker images (switch `Dockerfile.standalone` to `USER node`; separate change)
 - Inject inter-chat context into the system prompts of other platforms (Discord/Slack) (v2)

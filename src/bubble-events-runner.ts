@@ -23,6 +23,14 @@
 
 import { events, type Platform } from './events-emitter.js';
 import type { AgentRunner, RunOptions, RunResult, StreamCallbacks } from './agent-runner.js';
+import {
+  abortActivity,
+  completeActivity,
+  errorActivity,
+  startActivity,
+  updateActivityText,
+  updateActivityTool,
+} from './activity-store.js';
 
 export interface BubbleEventContext {
   threadId: string;
@@ -31,6 +39,8 @@ export interface BubbleEventContext {
   platform: Platform;
   /** turn.started に乗せる userText (任意) */
   userText?: string;
+  /** UI内部メタデータを共通eventsから除外する場合のみ指定。 */
+  eventTextSanitizer?: (text: string) => string;
 }
 
 const CANCEL_MESSAGE = 'Request cancelled by user';
@@ -42,31 +52,59 @@ export async function runWithBubbleEvents(
   callbacks: StreamCallbacks = {},
   options?: RunOptions
 ): Promise<RunResult> {
-  const { userText, ...eventBase } = ctx;
+  const { userText, eventTextSanitizer, ...eventBase } = ctx;
+  startActivity(ctx);
   events.turnStarted({ ...eventBase, userText });
   let errorEmitted = false;
+  let lastPublicText = '';
   try {
     const runOptions = {
       ...options,
       platform: options?.platform ?? ctx.platform,
+      userText: options?.userText ?? userText,
     };
 
     return await runner.runStream(
       prompt,
       {
+        onBackendReady: () => callbacks.onBackendReady?.(),
         onText: (chunk, fullText) => {
-          events.messageDelta({ ...eventBase, chunk, fullText });
+          const publicFullText = eventTextSanitizer ? eventTextSanitizer(fullText) : fullText;
+          const publicChunk = eventTextSanitizer
+            ? publicFullText.startsWith(lastPublicText)
+              ? publicFullText.slice(lastPublicText.length)
+              : eventTextSanitizer(chunk)
+            : chunk;
+          updateActivityText(ctx, publicFullText, publicChunk);
+          if (publicChunk) {
+            events.messageDelta({
+              ...eventBase,
+              chunk: publicChunk,
+              fullText: publicFullText,
+            });
+          }
+          lastPublicText = publicFullText;
           callbacks.onText?.(chunk, fullText);
         },
-        onToolUse: callbacks.onToolUse,
+        onToolUse: (toolName, toolInput) => {
+          updateActivityTool(ctx, toolName, toolInput);
+          callbacks.onToolUse?.(toolName, toolInput);
+        },
+        onTraceEvent: (event) => callbacks.onTraceEvent?.(event),
         onComplete: (result) => {
-          events.turnComplete({ ...eventBase, text: result.result });
+          const publicResult = eventTextSanitizer
+            ? eventTextSanitizer(result.result)
+            : result.result;
+          completeActivity(ctx, publicResult);
+          events.turnComplete({ ...eventBase, text: publicResult });
           callbacks.onComplete?.(result);
         },
         onError: (error) => {
           if (error.message === CANCEL_MESSAGE) {
+            abortActivity(ctx);
             events.turnAborted(eventBase);
           } else {
+            errorActivity(ctx, error.message);
             events.agentError({ ...eventBase, message: error.message });
           }
           errorEmitted = true;
@@ -79,8 +117,10 @@ export async function runWithBubbleEvents(
     if (!errorEmitted) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg === CANCEL_MESSAGE) {
+        abortActivity(ctx);
         events.turnAborted(eventBase);
       } else {
+        errorActivity(ctx, msg);
         events.agentError({ ...eventBase, message: msg });
       }
     }

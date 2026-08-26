@@ -36,11 +36,13 @@ export class CursorRunner extends CliRunnerBase {
 
   private force: boolean;
   private trustWorkspace: boolean;
+  private readonly systemPrompt: string;
 
   constructor(options?: BaseRunnerOptions) {
     super(options);
     this.force = process.env.CURSOR_FORCE !== 'false';
     this.trustWorkspace = process.env.CURSOR_TRUST_WORKSPACE !== 'false';
+    this.systemPrompt = buildSystemPrompt(options?.platform);
   }
 
   private buildBaseArgs(options?: RunOptions): string[] {
@@ -54,9 +56,11 @@ export class CursorRunner extends CliRunnerBase {
       args.push('--trust');
     }
 
-    if (this.model) {
-      args.push('--model', this.model);
+    if (options?.effort && !this.model) {
+      throw new Error('Cursor effort requires an explicit model');
     }
+    const model = this.model ?? 'auto';
+    args.push('--model', options?.effort ? this.withEffort(model, options.effort) : model);
 
     if (this.workdir) {
       args.push('--workspace', this.workdir);
@@ -69,10 +73,25 @@ export class CursorRunner extends CliRunnerBase {
     return args;
   }
 
+  private withEffort(model: string, effort: NonNullable<RunOptions['effort']>): string {
+    const bracketStart = model.indexOf('[');
+    const hasParameters = bracketStart > 0 && model.endsWith(']');
+    const baseModel = hasParameters ? model.slice(0, bracketStart) : model;
+    const rawParameters = hasParameters ? model.slice(bracketStart + 1, -1) : '';
+    const parameters = rawParameters
+      .split(',')
+      .map((parameter) => parameter.trim())
+      .filter((parameter) => parameter && !parameter.startsWith('effort='));
+
+    parameters.push(`effort=${effort}`);
+    return `${baseModel}[${parameters.join(',')}]`;
+  }
+
   private buildFullPrompt(rawPrompt: string): string {
-    const systemPrompt = buildSystemPrompt();
-    const promptWithRuntime = prependRuntimeContext(rawPrompt);
-    return systemPrompt ? `${systemPrompt}\n\n---\n\n${promptWithRuntime}` : promptWithRuntime;
+    const promptWithRuntime = prependRuntimeContext(rawPrompt, this.workdir);
+    return this.systemPrompt
+      ? `${this.systemPrompt}\n\n---\n\n${promptWithRuntime}`
+      : promptWithRuntime;
   }
 
   protected buildEnv(channelId?: string): NodeJS.ProcessEnv {
