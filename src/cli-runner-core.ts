@@ -41,6 +41,8 @@ export interface CliStreamParser {
 }
 
 export interface ExecuteStreamOptions {
+  /** 指定時は stdin を pipe にして書き込んでから閉じる（collectOutput の input と同じ理由） */
+  input?: string;
   channelId?: string;
   /**
    * エラー時に callbacks.onError を呼ぶか（default: true）。
@@ -53,6 +55,8 @@ export interface ExecuteStreamOptions {
 }
 
 export interface CollectOutputOptions {
+  /** 指定時は stdin を pipe にして書き込んでから閉じる（codex 0.148: 空のstdin＋引数promptだと何もせず終了するため） */
+  input?: string;
   /** exit code != 0 のとき stdout 全文からエラー詳細を抽出する（CLI の error イベント本文など） */
   exitErrorDetail?: (stdout: string) => string | undefined;
   /** 指定時のみ、Node.js の連続デコーダで stdout / stderr を文字列化する */
@@ -180,10 +184,14 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
     return new Promise((resolve, reject) => {
       const env = this.buildEnv(channelId);
       const proc = spawn(configuredBackendCommand(this.command, env), args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         cwd: this.workdir,
         env,
       });
+      if (opts.input !== undefined) {
+        proc.stdin?.write(opts.input);
+        proc.stdin?.end();
+      }
       this.currentProcess = proc;
       registerManagedCliProcess(channelId, proc, this.activeProcesses, this.timeoutController);
       const fallbackTimer = this.startFallbackTimeout(proc, channelId, reject);
@@ -236,10 +244,14 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       const parser = this.createStreamParser(callbacks);
       const env = this.buildEnv(opts.channelId);
       const proc = spawn(configuredBackendCommand(this.command, env), args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         cwd: this.workdir,
         env,
       });
+      if (opts.input !== undefined) {
+        proc.stdin?.write(opts.input);
+        proc.stdin?.end();
+      }
       this.currentProcess = proc;
       registerManagedCliProcess(opts.channelId, proc, this.activeProcesses, this.timeoutController);
 

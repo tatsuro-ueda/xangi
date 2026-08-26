@@ -74,6 +74,8 @@ export class CodexRunner extends CliRunnerBase {
   /**
    * コマンド引数を構築（run/runStream 共通）
    */
+  private pendingStdinPrompt = '';
+
   private buildArgs(prompt: string, options?: RunOptions): string[] {
     const args: string[] = ['exec', '--json'];
 
@@ -110,7 +112,9 @@ export class CodexRunner extends CliRunnerBase {
       ? `<system-context>\n${this.systemPrompt}\n</system-context>\n\n${prompt}`
       : prompt;
 
-    args.push(fullPrompt);
+    // codex 0.148: 引数promptはstdinが空パイプだと無視される。stdinで渡す（buildArgsはprompt無しの引数を返し、
+    // 呼び出し側が collectOutput の input で fullPrompt を渡す）
+    this.pendingStdinPrompt = fullPrompt;
 
     return args;
   }
@@ -248,6 +252,7 @@ export class CodexRunner extends CliRunnerBase {
     }
 
     const collectOpts = {
+      input: this.pendingStdinPrompt,
       exitErrorDetail: (stdout: string) => {
         let detail: string | undefined;
         this.forEachJsonlEvent(stdout, (event) => {
@@ -331,6 +336,7 @@ export class CodexRunner extends CliRunnerBase {
 
     try {
       return await this.executeStreamCore(args, callbacks, {
+        input: this.pendingStdinPrompt,
         channelId: options?.channelId,
         notifyOnError: false,
         onComplete,
