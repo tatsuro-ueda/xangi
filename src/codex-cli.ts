@@ -90,6 +90,10 @@ export class CodexRunner extends CliRunnerBase {
     // gitリポジトリ外でも動作するように
     args.push('--skip-git-repo-check');
 
+    // sandbox内から共通の脳（llm-wiki-remote・read-only HTTPS）へ届くようにする。
+    // ~/.codex/config.toml は chezmoi 配布のため書かず、呼び出しごとに上書きする
+    args.push('--config', 'sandbox_workspace_write.network_access=true');
+
     if (this.model) {
       args.push('--model', this.model);
     }
