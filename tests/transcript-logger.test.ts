@@ -1,16 +1,24 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 import {
   logPrompt,
   logResponse,
+  logError,
   readSessionMessages,
+  readSessionMessagesTail,
   updateMessageContent,
+  updateLatestMessageUsage,
   deleteMessage,
   attachPlatformMessageIdToLast,
+  ensureVisibleAssistantResponse,
   findEntryByPlatformMessageId,
+  initTranscriptStorage,
+  resetTranscriptStorageForTests,
+  deleteSessionTranscript,
+  getSessionLogPathForRead,
 } from '../src/transcript-logger.js';
 
 describe('transcript-logger edit/delete', () => {
@@ -22,6 +30,7 @@ describe('transcript-logger edit/delete', () => {
   });
 
   afterEach(() => {
+    resetTranscriptStorageForTests();
     rmSync(workdir, { recursive: true, force: true });
   });
 
@@ -50,6 +59,25 @@ describe('transcript-logger edit/delete', () => {
     expect(result).toBeNull();
     const after = readSessionMessages(workdir, sessionId);
     expect(after[0].content).toBe('foo'); // unchanged
+  });
+
+  it('updateLatestMessageUsage adds automatic metrics without marking the message edited', () => {
+    logPrompt(workdir, sessionId, 'run scheduled task');
+    logError(workdir, sessionId, 'failed');
+
+    const updated = updateLatestMessageUsage(workdir, sessionId, ['assistant', 'error'], {
+      duration_ms: 12_345,
+    });
+
+    expect(updated).toMatchObject({
+      role: 'error',
+      content: 'failed',
+      usage: { duration_ms: 12_345 },
+    });
+    expect(updated?.edited).toBeUndefined();
+    expect(readSessionMessages(workdir, sessionId).at(-1)).toMatchObject({
+      usage: { duration_ms: 12_345 },
+    });
   });
 
   it('deleteMessage removes the matching entry and keeps order of others', () => {
@@ -88,6 +116,17 @@ describe('transcript-logger edit/delete', () => {
     expect(raw.endsWith('\n')).toBe(true);
   });
 
+  it('readSessionMessagesTail reads only the requested trailing entries', () => {
+    for (let index = 0; index < 70; index++) {
+      logPrompt(workdir, sessionId, `${index}:${'x'.repeat(2000)}`);
+    }
+
+    const tail = readSessionMessagesTail(workdir, sessionId, 50);
+    expect(tail).toHaveLength(50);
+    expect(String(tail[0]?.content).startsWith('20:')).toBe(true);
+    expect(String(tail.at(-1)?.content).startsWith('69:')).toBe(true);
+  });
+
   it('attachPlatformMessageIdToLast attaches Discord message id to last user entry', () => {
     logPrompt(workdir, sessionId, 'hello');
     logResponse(workdir, sessionId, { result: 'hi' });
@@ -117,6 +156,72 @@ describe('transcript-logger edit/delete', () => {
     logPrompt(workdir, sessionId, 'a');
     const found = findEntryByPlatformMessageId(workdir, sessionId, 'nope');
     expect(found).toBeNull();
+  });
+
+  it('stores a platform-visible assistant response when the last user turn is unfinished', () => {
+    logPrompt(workdir, sessionId, 'restart now');
+
+    const stored = ensureVisibleAssistantResponse(
+      workdir,
+      sessionId,
+      'discord-reply-1',
+      '⏸ プロセス再起動により中断されました',
+      '2026-07-31T04:00:00.000Z'
+    );
+
+    expect(stored).toEqual(
+      expect.objectContaining({
+        role: 'assistant',
+        content: { result: '⏸ プロセス再起動により中断されました' },
+        createdAt: '2026-07-31T04:00:00.000Z',
+        platformMessageId: 'discord-reply-1',
+      })
+    );
+    expect(readSessionMessages(workdir, sessionId)).toHaveLength(2);
+  });
+
+  it('keeps an existing runner response and only attaches the platform message id', () => {
+    logPrompt(workdir, sessionId, 'restart after finishing');
+    logResponse(workdir, sessionId, { result: 'finished answer' });
+
+    const stored = ensureVisibleAssistantResponse(
+      workdir,
+      sessionId,
+      'discord-reply-2',
+      '⏸ プロセス再起動により中断されました'
+    );
+
+    expect(stored?.content).toEqual({ result: 'finished answer' });
+    expect(stored?.platformMessageId).toBe('discord-reply-2');
+    expect(readSessionMessages(workdir, sessionId)).toHaveLength(2);
+  });
+
+  it('does not duplicate a platform-visible response on repeated finalization', () => {
+    logPrompt(workdir, sessionId, 'restart once');
+    ensureVisibleAssistantResponse(workdir, sessionId, 'discord-reply-3', 'interrupted');
+    ensureVisibleAssistantResponse(workdir, sessionId, 'discord-reply-3', 'interrupted');
+
+    expect(readSessionMessages(workdir, sessionId)).toHaveLength(2);
+  });
+
+  it('stores an interrupted Web response without a platform message id', () => {
+    logPrompt(workdir, sessionId, 'restart from Web');
+
+    const stored = ensureVisibleAssistantResponse(
+      workdir,
+      sessionId,
+      undefined,
+      '⏸ プロセス再起動により中断されました'
+    );
+
+    expect(stored).toEqual(
+      expect.objectContaining({
+        role: 'assistant',
+        content: { result: '⏸ プロセス再起動により中断されました' },
+      })
+    );
+    expect(stored?.platformMessageId).toBeUndefined();
+    expect(readSessionMessages(workdir, sessionId)).toHaveLength(2);
   });
 
   it('Discord edit flow: attach → findByPlatformMessageId → updateMessageContent', () => {
@@ -151,5 +256,100 @@ describe('transcript-logger edit/delete', () => {
 
     const all = readSessionMessages(workdir, sessionId);
     expect(all).toHaveLength(0);
+  });
+
+  it('writes new transcripts under DATA_DIR instead of the selected workspace', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'transcript-data-'));
+    const selectedWorkspace = mkdtempSync(join(tmpdir(), 'transcript-workspace-'));
+    try {
+      initTranscriptStorage(dataDir, workdir);
+      logPrompt(selectedWorkspace, sessionId, 'central');
+
+      expect(existsSync(join(dataDir, 'logs', 'sessions', `${sessionId}.jsonl`))).toBe(true);
+      expect(existsSync(join(selectedWorkspace, 'logs', 'sessions', `${sessionId}.jsonl`))).toBe(
+        false
+      );
+      expect(readSessionMessages(selectedWorkspace, sessionId)[0]?.content).toBe('central');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(selectedWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects path separators in transcript session IDs', () => {
+    expect(() => getSessionLogPathForRead(workdir, '../../victim')).toThrow(
+      /Invalid transcript session ID/
+    );
+    expect(() => getSessionLogPathForRead(workdir, '..\\..\\victim')).toThrow(
+      /Invalid transcript session ID/
+    );
+  });
+
+  it('falls back to a legacy startup-workdir transcript when DATA_DIR has no copy', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'transcript-data-'));
+    const legacyDir = join(workdir, 'logs', 'sessions');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(
+      join(legacyDir, `${sessionId}.jsonl`),
+      `${JSON.stringify({
+        id: 'legacy-message',
+        role: 'user',
+        content: 'legacy',
+        createdAt: '2026-07-30T00:00:00.000Z',
+      })}\n`
+    );
+    try {
+      initTranscriptStorage(dataDir, workdir);
+      expect(readSessionMessages('/another/workspace', sessionId)[0]?.content).toBe('legacy');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('copies legacy history before the first central append', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'transcript-data-'));
+    const legacyDir = join(workdir, 'logs', 'sessions');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(
+      join(legacyDir, `${sessionId}.jsonl`),
+      `${JSON.stringify({
+        id: 'legacy-message',
+        role: 'user',
+        content: 'legacy',
+        createdAt: '2026-07-30T00:00:00.000Z',
+      })}\n`
+    );
+    try {
+      initTranscriptStorage(dataDir, workdir);
+      logPrompt('/selected/workspace', sessionId, 'new message');
+
+      const centralPath = join(dataDir, 'logs', 'sessions', `${sessionId}.jsonl`);
+      expect(existsSync(centralPath)).toBe(true);
+      expect(
+        readSessionMessages('/selected/workspace', sessionId).map((entry) => entry.content)
+      ).toEqual(['legacy', 'new message']);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes both central and legacy transcript copies', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'transcript-data-'));
+    const legacyDir = join(workdir, 'logs', 'sessions');
+    const centralDir = join(dataDir, 'logs', 'sessions');
+    mkdirSync(legacyDir, { recursive: true });
+    mkdirSync(centralDir, { recursive: true });
+    const legacyPath = join(legacyDir, `${sessionId}.jsonl`);
+    const centralPath = join(centralDir, `${sessionId}.jsonl`);
+    writeFileSync(legacyPath, 'legacy\n');
+    writeFileSync(centralPath, 'central\n');
+    try {
+      initTranscriptStorage(dataDir, workdir);
+      expect(deleteSessionTranscript('/selected/workspace', sessionId)).toBe(true);
+      expect(existsSync(legacyPath)).toBe(false);
+      expect(existsSync(centralPath)).toBe(false);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,199 +1,160 @@
-**日本語** | [English](README.en.md)
+日本語 | [English](README.en.md)
 
 # xangi
 
-> **A**I **N**EON **G**ENESIS **I**NTELLIGENCE
+[![CI Build](https://github.com/karaage0703/xangi/actions/workflows/ci.yml/badge.svg)](https://github.com/karaage0703/xangi/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/karaage0703/xangi)](https://github.com/karaage0703/xangi/releases)
+[![License](https://img.shields.io/github/license/karaage0703/xangi)](LICENSE)
 
-Claude Code / Codex / Cursor CLI / Grok CLI / Local LLMをバックエンドに、Discord / Slack / ブラウザ / LINE から利用できる AI アシスタント。Discord 推奨、ブラウザ単独でも動作可。
+> **A**GENTIC **N**EON **G**ENESIS **I**NTELLIGENCE
 
-## Features
+Claude Code、Codex、OpenCode、Cursor CLI、Grok CLI、Antigravity CLI、GitHub Copilot CLI、Local LLMを、Discord、Slack、Telegram、Web Chat、LINEから使えるAIアシスタントです。Discordを推奨しますが、ブラウザだけでも利用できます。
 
-- Discord / Slack / Web Chat UI / LINE 対応
-- Claude Code / Codex / Cursor CLI / Grok CLI / Local LLM 対応
-- `/backend` でチャンネルごとに backend / model / effort を切り替え
-- スキル、スケジューラー、イベントトリガー
-- Docker、pm2、自動再起動対応
-- セッション永続化、タイムアウト延長、ワークスペース hooks
+## 主な機能
+
+- 6種類のAIバックエンドと5種類のチャット画面に対応
+- チャンネルごとのbackend・model・effort・Local LLM reasoning effort切り替えと、利用可能なモデルの動的取得
+- 自然言語またはネイティブコマンドから、許可されたチャンネル設定を再起動なしで即時変更
+- ワークスペースのskillsをチャットから実行
+- セッション・会話履歴の永続化、タイムアウト延長、ワークスペースhooks
+- スケジューラーと外部イベントからのエージェント起動
+- Web Chatからワークスペース内のMarkdown・コードを閲覧・編集
+- Web Projectによる会話の分類・既存会話の移動と、Projectごとの追加プロンプト・既定モデル設定
+- [外部extension連携](docs/usage.md#extension連携)（Web UIから追加・管理）
 
 ## アーキテクチャ
 
 ```mermaid
 flowchart LR
-    User([ユーザー]) <-->|メッセージ| chat[UI<br/>Discord / Slack<br/>ブラウザ / LINE]
-    chat <-->|プロンプト| xangi[xangi]
-    xangi <-->|実行| LLM{{LLMバックエンド<br/>Claude Code / Codex<br/>Cursor CLI / Grok CLI<br/>Local LLM}}
-    LLM <-->|ファイル操作| WS[(Workspace<br/>AGENTS.md / skills<br/>ローカル資料)]
-    LLM <--> Web[Web検索]
-    LLM <--> Service[Webサービス]
-    xangi -->|定期実行| Scheduler
-    Scheduler -->|プロンプト| LLM
+    User([ユーザー]) <-->|メッセージ| Platform[チャットプラットフォーム]
+    Platform <-->|プロンプト / 応答| xangi[xangi]
+    xangi <-->|実行| Backend{{エージェントバックエンド}}
+    Backend <-->|読み書き| WS[(ワークスペース)]
+    Backend <--> External[外部情報 / Webサービス]
+    Scheduler[[スケジューラー / イベントトリガー]] -->|プロンプト| xangi
 
     classDef user fill:#fef3c7,stroke:#d97706,color:#111;
     classDef core fill:#dbeafe,stroke:#1e40af,color:#111;
     classDef ws fill:#fef9c3,stroke:#a16207,color:#111;
     classDef ext fill:#f3f4f6,stroke:#6b7280,color:#111;
     class User user;
-    class chat,xangi,LLM,Scheduler core;
+    class Platform,xangi,Backend,Scheduler core;
     class WS ws;
-    class Web,Service ext;
+    class External ext;
 ```
 
-## Quick Start
+## Quickstart
 
-### 1. 環境変数設定
+macOS、Linux、WSL2で共通です。
+
+1. 利用するAIツールを1つ準備します。例はCodexです。
+
+   ```bash
+   bash <(curl -fsSL https://github.com/karaage0703/xangi/releases/latest/download/setup-ai-tools.sh) codex
+   ```
+
+   `codex`の代わりに`claude-code`、`cursor`、`grok`、`antigravity`、`github-copilot`、`opencode`も選べます。
+
+2. xangiをインストールします。
+
+   ```bash
+   curl -fsSL https://github.com/karaage0703/xangi/releases/latest/download/install.sh | bash
+   ```
+
+3. 新しいTerminalを開いて、対話セットアップを開始します。
+
+   ```bash
+   xangi setup
+   ```
+
+セットアップでは、ワークスペースとAIバックエンドを選び、まずWeb Chatをlocalで起動・確認します。TailscaleやLANでの公開は、localの基本セットアップが完了した後の任意設定です。途中で止まった場合や状態が分からない場合は、次を実行してください。
+
+```bash
+xangi doctor
+```
+
+詳しいインストール、更新、削除、設定保存先は[使い方ガイド](docs/usage.md#gitを使わない初回インストール)を参照してください。
+
+## 使い始める
+
+- Web Chat: 初回は`http://127.0.0.1:18888`
+- Discord、Slack、Telegram、LINE: セットアップしたbotへメッセージを送信
+- 状態確認: `xangi doctor`
+- Web UIアクセス先・疎通確認: `xangi tool web_status`
+- バージョン確認: `xangi --version`
+- 接続情報の変更: `xangi settings`
+- サービスを起動していない場合: `xangi service start`
+
+チャットコマンド、Terminal CLI、スケジューラー、Docker、Local LLM、環境変数の詳細は[使い方ガイド](docs/usage.md)にまとめています。
+
+## プラットフォーム設定
+
+- [Discord](docs/discord-setup.md)
+- [Slack](docs/slack-setup.md)
+- [Telegram](docs/telegram-setup.md)
+- [LINE](docs/line-setup.md)
+- Web Chatは`xangi setup`だけで設定可能
+
+## ソースから開発する
+
+ここからはxangi自体を開発する人向けです。Node.js 22以降、npm、利用するAI CLIが必要です。
 
 ```bash
 cp .env.example .env
-```
-
-**最低限の設定（.env）:**
-```bash
-# Discord Bot Token（必須）
-DISCORD_TOKEN=your_discord_bot_token
-
-# 許可ユーザーID（必須、カンマ区切りで複数可、"*"で全員許可）
-DISCORD_ALLOWED_USER=123456789012345678
-```
-
-> 💡 作業ディレクトリはデフォルトで `./workspace` を使用。変更する場合は `WORKSPACE_PATH` を設定。
-
-> 💡 Discord Bot の作成方法・ID の調べ方は [Discord セットアップ](docs/discord-setup.md) を参照。
-
-### 2. ビルド・起動
-
-```bash
-# Node.js 22+ と使用するAI CLIが必要
-# Claude Code: curl -fsSL https://claude.ai/install.sh | bash
-# Codex CLI:   npm install -g @openai/codex
-# Cursor CLI:  curl https://cursor.com/install -fsS | bash
-# Grok CLI:    curl -fsSL https://x.ai/cli/install.sh | bash
-# Antigravity CLI: curl -fsSL https://antigravity.google/cli/install.sh | bash
-# Local LLM:   Ollama (https://ollama.com) をインストール
-
-npm install
+npm ci
 npm run build
 npm start
-
-# 開発時
-npm run dev
 ```
 
-### 3. 動作確認
+Discordを使う場合は`.env`に`DISCORD_TOKEN`と`DISCORD_ALLOWED_USER`を設定します。Web Chatだけで使う場合は`WEB_CHAT_ENABLED=true`を設定します。ソースcheckoutの既定ワークスペースは起動時のカレントディレクトリです。必要に応じて`WORKSPACE_PATH`を指定してください。
 
-Discord で bot にメンションして話しかけてください。
+開発時の起動は`npm run dev`、検証用コマンドは`npm test`、`npm run typecheck`、`npm run lint`、`npm run format:check`です。PM2、複数instance、主要な環境変数は[使い方ガイド](docs/usage.md)、設定例は[.env.example](.env.example)を参照してください。
 
-### Discord/Slack の代わりにブラウザで使う
-
-トークンを用意したくない・LAN 内のブラウザだけで使いたい場合は、Web Chat UI 単独でも起動できます。
-
-`.env` に以下を追加：
+Dockerを使う場合:
 
 ```bash
-WEB_CHAT_ENABLED=true
-```
-
-```bash
-npm start
-```
-
-ブラウザで `http://localhost:18888` にアクセスして会話を開始。
-
-> 💡 ポート競合を避けるため Web Chat UI は明示的に `WEB_CHAT_ENABLED=true` した時だけ起動します。ポート変更は `WEB_CHAT_PORT` で。
-> 💡 Slack を使う場合は [Slack セットアップ](docs/slack-setup.md) を参照。
-
-### 自動再起動（pm2）
-
-xangi は `/restart` コマンドで再起動できます。自動復帰にはプロセスマネージャが必要です。
-
-```bash
-npm install -g pm2
-pm2 start "npm start" --name xangi
-pm2 restart xangi  # 手動再起動
-pm2 logs xangi     # ログ確認
-```
-
-## 使い方
-
-### 基本
-- `@xangi 質問内容` - メンションで反応
-- 専用チャンネル設定時はメンション不要
-
-### 主なコマンド
-
-| コマンド | 説明 |
-|----------|------|
-| `/new` | 新しいセッションを開始 |
-| `/stop` | 実行中のタスクを停止 |
-| `/settings` | 現在の設定を表示 |
-| `/notify` | チャンネルごとの完了通知を切り替え |
-| `/backend` | チャンネルごとのバックエンド・モデル切り替え |
-| `xangi-cmd schedule_*` | スケジューラー（定期実行・リマインダー） |
-| `xangi-cmd discord_*` | Discord操作（履歴取得・メッセージ送信・検索等） |
-| `xangi-cmd trigger` | イベントトリガー（処理完了時にエージェントターンを起動） |
-
-応答メッセージにはボタン（Stop / New Session）が表示されます。`DISCORD_SHOW_BUTTONS=false` で非表示。
-
-詳細は [使い方ガイド](docs/usage.md) を参照してください。
-
-## Docker で実行する場合
-
-コンテナ隔離環境で実行したい場合は Docker も利用できます。
-
-```bash
-# Claude Code バックエンド
+# Claude Code backend
 docker compose up xangi -d --build
 
-# Local LLM バックエンド（Ollama）
+# フル版（Local LLMを使う場合は.envでAGENT_BACKEND=local-llmも設定）
 docker compose up xangi-max -d --build
 
-# GPU版（CUDA + Python + PyTorch）
+# CUDA / PyTorchを含むGPU版
 docker compose up xangi-gpu -d --build
 ```
 
-詳細は [使い方ガイド: Docker実行](docs/usage.md#docker実行) を参照してください。
+詳細は[Docker実行](docs/usage.md#docker実行)を参照してください。
 
-## 環境変数
+## セキュリティ
 
-### 必須（Discord 利用時）
-
-| 変数 | 説明 |
-|------|------|
-| `DISCORD_TOKEN` | Discord Bot Token |
-| `DISCORD_ALLOWED_USER` | 許可ユーザーID（カンマ区切りで複数可、`*`で全員許可） |
-
-ブラウザ単独で使う場合は `WEB_CHAT_ENABLED=true` のみで起動可能（トークン不要）。
-
-全ての環境変数（オプション含む）は [使い方ガイド](docs/usage.md#環境変数一覧) を参照してください。
+- Web Chat自体には認証がありません。LANへ公開すると、同じ範囲からワークスペースの閲覧・編集も可能になります。通常はローカル公開かTailscaleを選んでください。
+- `xangi settings`は`127.0.0.1`だけで一時的に開き、保存済みtokenをブラウザへ返しません。
+- 外部サービスのtokenをAIとの会話やshell historyへ貼らないでください。
 
 ## ワークスペース
 
-推奨ワークスペース: [ai-assistant-workspace](https://github.com/karaage0703/ai-assistant-workspace)
-
-スキル（メモ管理・日記・音声文字起こし・Notion連携など）がプリセットされたスターターキットです。xangi と組み合わせることで、チャットからスキルを呼び出して日常タスクを自動化できます。
+スキル、メモ、日記、文字起こし、Notion連携などを含むスターターキットとして、[ai-assistant-workspace](https://github.com/karaage0703/ai-assistant-workspace)を利用できます。
 
 ## 関連プロジェクト
 
-- [xangi-stackchan](https://github.com/karaage0703/xangi-stackchan) - xangi の応答をスタックチャン（M5Stack）に喋らせる・表情/首振り連動させる常駐ブリッジ。[外部イベントストリーム](docs/events.md)の SSE を購読して動作
-
-## 書籍
-
-📖 [生活に溶け込むAI — AIエージェントで作る、自分だけのアシスタント](https://karaage0703.booth.pm/items/8027277)
-
-xangi を使ったAIアシスタント構築のノウハウをまとめた書籍です。
+- [xangi-stackchan](https://github.com/karaage0703/xangi-stackchan) - xangiの応答をM5Stackで喋らせ、表情や首振りと連動するブリッジ
+- [xangi-even-g2](https://github.com/karaage0703/xangi-even-g2) - Even Realities G2からxangiを操作するEven Hubアプリとbridge
+- [xangi-pets](https://github.com/karaage0703/xangi-pets) - xangiの状態と応答を表示するデスクトップ常駐ペット
 
 ## ドキュメント
 
-- [使い方ガイド](docs/usage.md) - Docker実行・環境変数・Local LLM・複数インスタンスの運用・セッションの保持期間・トラブルシューティング
-- [Discord セットアップ](docs/discord-setup.md) - Bot作成・ID確認方法
-- [Slack セットアップ](docs/slack-setup.md) - Slack連携
-- [LINE セットアップ](docs/line-setup.md) - LINE Messaging API 連携 (Tailscale Funnel での外部公開含む)
-- [設計ドキュメント](docs/design.md) - アーキテクチャ・設計思想・データフロー
-- [外部イベントストリーム](docs/events.md) - 応答ライフサイクルのイベント配信仕様
-- [インスタンス間チャット](docs/inter-instance-chat.md) - 複数インスタンス間のメッセージ交換・auto-talk
+- [使い方ガイド](docs/usage.md) - コマンド、設定、Docker、Local LLM、複数instance、トラブルシューティング
+- [設計ドキュメント](docs/design.md) - アーキテクチャ、コンポーネント、データフロー
+- [外部イベントストリーム](docs/events.md) - SSEとdevice入力API
+- [インスタンス間チャット](docs/inter-instance-chat.md) - 複数instance間のメッセージ交換
+
+## 書籍
+
+[生活に溶け込むAI — AIエージェントで作る、自分だけのアシスタント](https://karaage0703.booth.pm/items/8027277)
 
 ## Acknowledgments
 
-xangi のコンセプトは [OpenClaw](https://github.com/openclaw/openclaw) に影響を受けています。
+xangiのコンセプトは[OpenClaw](https://github.com/openclaw/openclaw)に影響を受けています。
 
 ## License
 

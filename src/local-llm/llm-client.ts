@@ -2,6 +2,9 @@
  * OpenAI互換 + Ollama ネイティブAPI 対応 LLMクライアント
  */
 import type { LLMMessage, LLMToolCall, LLMChatOptions, LLMChatResponse } from './types.js';
+import { Agent } from 'undici';
+import { formatErrorDiagnostic, isTransientNetworkError } from '../errors.js';
+import { parsePseudoToolCall } from './pseudo-toolcall.js';
 
 /**
  * OpenAI 形式 (chat completions / streaming 共通) の tools / tool_choice を
@@ -9,10 +12,16 @@ import type { LLMMessage, LLMToolCall, LLMChatOptions, LLMChatResponse } from '.
  *
  * - tools 未指定 or 空配列 → 何もしない
  * - tools 指定あり → body.tools にスキーマ展開
- * - toolChoice 明示 → body.tool_choice 反映（'auto' / 'none' / 'required' / function 指定）
+ * - toolChoice='none' → tools/tool_choice とも送らない（tool なしと同義）
+ * - その他の toolChoice 明示 → body.tool_choice 反映
+ *
+ * OpenAI 互換サーバには tool_choice='none' を解釈せず、tools があるだけで
+ * chat template へ tool call 指示を埋め込む実装がある。最終回答では tools 自体を
+ * 外すことが、バックエンドに依存しない確実な無効化になる。
  */
 function applyOpenAITools(body: Record<string, unknown>, options?: LLMChatOptions): void {
   if (!options?.tools || options.tools.length === 0) return;
+  if (options.toolChoice === 'none') return;
   body.tools = options.tools.map((t) => ({
     type: 'function',
     function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -86,8 +95,7 @@ function toOllamaMessages(messages: LLMMessage[]): Array<Record<string, unknown>
 export const __testables = { applyOpenAITools, applyOllamaTools, toOllamaMessages };
 
 type OpenAIContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } };
+  { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
 
 interface OpenAIMessage {
   role: string;
@@ -114,6 +122,11 @@ interface OpenAIChatResponse {
     };
     finish_reason: string;
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+  };
 }
 
 function toOpenAIMessages(messages: LLMMessage[], isOllama: boolean): OpenAIMessage[] {
@@ -152,6 +165,8 @@ function toOpenAIMessages(messages: LLMMessage[], isOllama: boolean): OpenAIMess
 
 export class LLMClient {
   private readonly timeoutMs: number;
+  private readonly dispatcher: Agent;
+  private static readonly MAX_IMMEDIATE_TRANSPORT_RETRY_MS = 30_000;
 
   constructor(
     private readonly baseUrl: string,
@@ -160,14 +175,49 @@ export class LLMClient {
     private readonly thinking: boolean = false,
     private readonly defaultMaxTokens: number = 8192,
     private readonly numCtx?: number,
-    private readonly defaultTemperature?: number
+    private readonly defaultTemperature?: number,
+    private readonly defaultReasoningEffort?: import('./reasoning-effort.js').LocalLlmReasoningEffort
   ) {
     this.timeoutMs = parseInt(process.env.TIMEOUT_MS || '300000', 10);
+    this.dispatcher = new Agent({
+      headersTimeout: this.timeoutMs,
+      bodyTimeout: this.timeoutMs,
+    });
   }
 
   /** options.temperature が明示なら優先、なければ defaultTemperature を返す */
   private resolveTemperature(optTemp?: number): number | undefined {
     return optTemp !== undefined ? optTemp : this.defaultTemperature;
+  }
+
+  /**
+   * HTTP応答を受け取る前の一時的な通信失敗だけを1回再試行する。
+   * HTTP 4xx/5xx、ユーザーキャンセル、応答取得後のstream失敗は対象外。
+   */
+  private async fetchWithTransientRetry(
+    url: string,
+    init: RequestInit,
+    operation: string
+  ): Promise<Response> {
+    const requestInit = { ...init, dispatcher: this.dispatcher } as RequestInit;
+    const startedAt = Date.now();
+    try {
+      return await fetch(url, requestInit);
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      if (
+        init.signal?.aborted ||
+        !isTransientNetworkError(error) ||
+        elapsedMs > LLMClient.MAX_IMMEDIATE_TRANSPORT_RETRY_MS
+      ) {
+        throw error;
+      }
+
+      console.warn(
+        `[local-llm] Transient ${operation} transport error; retrying once: ${formatErrorDiagnostic(error)}`
+      );
+      return await fetch(url, requestInit);
+    }
   }
 
   async chat(messages: LLMMessage[], options?: LLMChatOptions): Promise<LLMChatResponse> {
@@ -212,16 +262,21 @@ export class LLMClient {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
     if (options?.signal) {
-      options.signal.addEventListener('abort', () => controller.abort());
+      if (options.signal.aborted) controller.abort();
+      else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
     }
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      response = await this.fetchWithTransientRetry(
+        `${this.baseUrl}/api/chat`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        },
+        'Ollama chat'
+      );
     } finally {
       clearTimeout(timeoutId);
     }
@@ -239,6 +294,8 @@ export class LLMClient {
         }>;
       };
       done_reason?: string;
+      prompt_eval_count?: number;
+      eval_count?: number;
     };
 
     const toolCalls: LLMToolCall[] = [];
@@ -260,6 +317,10 @@ export class LLMClient {
       content: data.message.content ?? '',
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       finishReason,
+      usage: {
+        inputTokens: data.prompt_eval_count,
+        outputTokens: data.eval_count,
+      },
     };
   }
 
@@ -279,6 +340,8 @@ export class LLMClient {
       stream: false,
       max_tokens: options?.maxTokens ?? this.defaultMaxTokens,
     };
+    const reasoningEffort = options?.reasoningEffort ?? this.defaultReasoningEffort;
+    if (reasoningEffort) body.reasoning_effort = reasoningEffort;
 
     applyOpenAITools(body, options);
 
@@ -294,16 +357,21 @@ export class LLMClient {
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
     // 外部からのAbortSignalも連携
     if (options?.signal) {
-      options.signal.addEventListener('abort', () => controller.abort());
+      if (options.signal.aborted) controller.abort();
+      else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
     }
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      response = await this.fetchWithTransientRetry(
+        `${this.baseUrl}/v1/chat/completions`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        },
+        'OpenAI-compatible chat'
+      );
     } finally {
       clearTimeout(timeoutId);
     }
@@ -333,20 +401,43 @@ export class LLMClient {
       }
     }
 
-    let finishReason: LLMChatResponse['finishReason'] = 'stop';
-    if (choice.finish_reason === 'tool_calls') finishReason = 'tool_calls';
-    else if (choice.finish_reason === 'length') finishReason = 'length';
-
     // Thinking model: content が空で reasoning に推論が入ることがある
     let content = choice.message.content ?? '';
     if (!content && choice.message.reasoning) {
       content = choice.message.reasoning;
     }
 
+    // llama.cpp 等の OpenAI 互換サーバは、chat template 指定の XML tool call を
+    // まれに message.tool_calls へ構造化せず content で返す。tools が有効な通常ループ中に
+    // 完全な XML 一個だけが返った場合は、同じスキーマの構造化 call へ復元する。
+    // toolChoice='none' の最終回答には適用しない（その経路は表示サニタイザが扱う）。
+    if (toolCalls.length === 0 && options?.tools?.length && options.toolChoice !== 'none') {
+      const recovered = parsePseudoToolCall(content);
+      if (recovered && options.tools.some((tool) => tool.name === recovered.name)) {
+        toolCalls.push({
+          id: crypto.randomUUID(),
+          name: recovered.name,
+          arguments: recovered.args,
+        });
+        content = '';
+      }
+    }
+
+    let finishReason: LLMChatResponse['finishReason'] = 'stop';
+    if (toolCalls.length > 0 || choice.finish_reason === 'tool_calls') finishReason = 'tool_calls';
+    else if (choice.finish_reason === 'length') finishReason = 'length';
+
     return {
       content,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       finishReason,
+      usage: data.usage
+        ? {
+            inputTokens: data.usage.prompt_tokens,
+            cachedInputTokens: data.usage.prompt_tokens_details?.cached_tokens,
+            outputTokens: data.usage.completion_tokens,
+          }
+        : undefined,
     };
   }
 
@@ -369,6 +460,8 @@ export class LLMClient {
       stream: true,
       max_tokens: options?.maxTokens ?? this.defaultMaxTokens,
     };
+    const reasoningEffort = options?.reasoningEffort ?? this.defaultReasoningEffort;
+    if (reasoningEffort) body.reasoning_effort = reasoningEffort;
 
     // tools / tool_choice — chatOpenAI と同等。streaming でも tool calling 機構を有効にする。
     // tools 未指定の streaming だと、LLM が tool 呼びたい場面で擬似 tool_call 文字列を
@@ -384,12 +477,16 @@ export class LLMClient {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
 
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: options?.signal,
-    });
+    const response = await this.fetchWithTransientRetry(
+      `${this.baseUrl}/v1/chat/completions`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: options?.signal,
+      },
+      'OpenAI-compatible stream'
+    );
 
     if (!response.ok) {
       throw new Error(`LLM API error ${response.status}: ${await response.text()}`);
@@ -477,11 +574,15 @@ export class LLMClient {
       };
     }
 
-    const response = await fetch(`${this.baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const response = await this.fetchWithTransientRetry(
+      `${this.baseUrl}/api/chat`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      'Ollama stream'
+    );
 
     if (!response.ok) {
       throw new Error(`Ollama API error ${response.status}: ${await response.text()}`);

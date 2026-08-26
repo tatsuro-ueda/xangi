@@ -38,10 +38,7 @@ export interface LLMTool {
  * - { type: 'function', function: { name } }: 特定 tool を強制
  */
 export type LLMToolChoice =
-  | 'auto'
-  | 'none'
-  | 'required'
-  | { type: 'function'; function: { name: string } };
+  'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
 
 export interface LLMChatOptions {
   tools?: LLMTool[];
@@ -50,12 +47,19 @@ export interface LLMChatOptions {
   maxTokens?: number;
   systemPrompt?: string;
   signal?: AbortSignal;
+  /** OpenAI互換APIへ送るトップレベル reasoning_effort */
+  reasoningEffort?: import('./reasoning-effort.js').LocalLlmReasoningEffort;
 }
 
 export interface LLMChatResponse {
   content: string;
   toolCalls?: LLMToolCall[];
   finishReason: 'stop' | 'tool_calls' | 'length';
+  usage?: {
+    inputTokens?: number;
+    cachedInputTokens?: number;
+    outputTokens?: number;
+  };
 }
 
 export interface ToolContext {

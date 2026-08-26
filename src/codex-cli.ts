@@ -29,6 +29,9 @@ interface CodexEvent {
     command?: string;
     arguments?: string | Record<string, unknown>;
     input?: string | Record<string, unknown>;
+    aggregated_output?: string;
+    exit_code?: number | null;
+    status?: string;
   };
   payload?: {
     type?: string;
@@ -86,6 +89,10 @@ export class CodexRunner extends CliRunnerBase {
 
     if (this.model) {
       args.push('--model', this.model);
+    }
+
+    if (options?.effort) {
+      args.push('--config', `model_reasoning_effort="${options.effort}"`);
     }
 
     if (this.workdir) {
@@ -229,7 +236,7 @@ export class CodexRunner extends CliRunnerBase {
   }
 
   async run(rawPrompt: string, options?: RunOptions): Promise<RunResult> {
-    const prompt = prependRuntimeContext(rawPrompt);
+    const prompt = prependRuntimeContext(rawPrompt, this.workdir);
     const args = this.buildArgs(prompt, options);
 
     this.logExecution('Executing', options);
@@ -301,7 +308,7 @@ export class CodexRunner extends CliRunnerBase {
     callbacks: StreamCallbacks,
     options?: RunOptions
   ): Promise<RunResult> {
-    const prompt = prependRuntimeContext(rawPrompt);
+    const prompt = prependRuntimeContext(rawPrompt, this.workdir);
     const args = this.buildArgs(prompt, options);
 
     this.logExecution('Streaming', options);
@@ -349,10 +356,20 @@ export class CodexRunner extends CliRunnerBase {
     let sessionId = '';
     let errorMessage: string | undefined;
     const emittedToolIds = new Set<string>();
+    let backendReady = false;
 
     return {
       handleEvent: (json, phase) => {
         const event = json as CodexEvent;
+
+        if (!backendReady && event.type === 'thread.started') {
+          backendReady = true;
+          callbacks.onBackendReady?.();
+        }
+
+        if (event.type === 'turn.started') {
+          callbacks.onTraceEvent?.({ type: 'turn_started' });
+        }
 
         // セッションID抽出
         const sid = this.extractSessionId(event);
@@ -370,6 +387,27 @@ export class CodexRunner extends CliRunnerBase {
             emittedToolIds.add(eventKey);
             callbacks.onToolUse?.(toolUse.name, toolUse.input);
           }
+
+          const item = event.item ?? event.payload?.item;
+          if (event.type === 'item.started') {
+            callbacks.onTraceEvent?.({
+              type: 'tool_started',
+              toolId: itemId,
+              toolName: toolUse.name,
+            });
+          } else if (event.type === 'item.completed') {
+            callbacks.onTraceEvent?.({
+              type: 'tool_completed',
+              toolId: itemId,
+              toolName: toolUse.name,
+              status: item?.status,
+              exitCode: item?.exit_code,
+              outputBytes:
+                typeof item?.aggregated_output === 'string'
+                  ? Buffer.byteLength(item.aggregated_output, 'utf8')
+                  : undefined,
+            });
+          }
         }
 
         // テキスト抽出
@@ -379,6 +417,9 @@ export class CodexRunner extends CliRunnerBase {
           if (phase === 'stream') {
             callbacks.onText?.(extracted.text, fullText);
           }
+          if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
+            callbacks.onTraceEvent?.({ type: 'message_completed' });
+          }
         }
 
         // トークン使用量ログ
@@ -386,6 +427,18 @@ export class CodexRunner extends CliRunnerBase {
           console.log(
             `[codex] Usage: input=${event.usage.input_tokens} (cached=${event.usage.cached_input_tokens ?? 0}), output=${event.usage.output_tokens}`
           );
+        }
+        if (event.type === 'turn.completed') {
+          callbacks.onTraceEvent?.({
+            type: 'turn_completed',
+            usage: event.usage
+              ? {
+                  inputTokens: event.usage.input_tokens,
+                  cachedInputTokens: event.usage.cached_input_tokens,
+                  outputTokens: event.usage.output_tokens,
+                }
+              : undefined,
+          });
         }
 
         return undefined;

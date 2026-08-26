@@ -2,31 +2,55 @@
  * xangi Tool Server — Claude Code向けHTTPエンドポイント
  *
  * xangiプロセス内で起動し、Discord/Schedule/System操作のHTTP APIを提供。
- * Claude CodeはBashツールでxangi-cmdを使ってこのサーバーに問い合わせる。
+ * Claude CodeはBashツールでxangi toolを使ってこのサーバーに問い合わせる。
  *
  * ポートはOS自動割り当て（競合なし）。起動後に
  * process.env.XANGI_TOOL_SERVER に接続先URLを設定し、
- * xangi-cmdを使う子プロセスへ渡す。
+ * xangi toolを使う子プロセスへ渡す。
  */
 import { createServer, type Server } from 'http';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { discordApi } from './cli/discord-api.js';
+import { slackApi } from './cli/slack-api.js';
 import { scheduleCmd } from './cli/schedule-cmd.js';
 import { systemCmd } from './cli/system-cmd.js';
 import { webHistoryCmd } from './cli/web-history-cmd.js';
+import { slackHistoryCmd } from './cli/slack-history-cmd.js';
 import { isGitHubAppEnabled, generateInstallationToken } from './github-auth.js';
 import { ValidationError } from './errors.js';
 import type { EventTrigger, TriggerRequestBody } from './event-trigger.js';
+import { discoverBackendModels } from './backend-models.js';
+import type { BackendResolver } from './backend-resolver.js';
+import { executeModelsCommand, selectModelForNextTurn } from './models-command.js';
+import { formatXangiCmdHelp } from './cli/xangi-cmd-help.js';
+import { webStatusCmd } from './web-status.js';
+import type { Config } from './config.js';
+import type { ChatPlatform } from './prompts/index.js';
+import { executeRuntimeSettingsCommand } from './runtime-settings-command.js';
+import type { Scheduler } from './scheduler.js';
+import { listExtensions, runExtensionAction, type ExtensionAction } from './extensions.js';
+import { executeExtensionRequest } from './extension-request.js';
+import { updateExtension } from './extension-update.js';
+import { finalizeDevelopmentExtensionUninstall } from './extension-catalog.js';
 
 let server: Server | null = null;
 let eventTrigger: EventTrigger | null = null;
+let backendResolver: BackendResolver | null = null;
+let runtimeConfig: Config | null = null;
+let scheduleManager: Scheduler | null = null;
+let modelDiscovery: typeof discoverBackendModels = discoverBackendModels;
+let webStatusCommand: typeof webStatusCmd = webStatusCmd;
+let extensionUpdateCommand: typeof updateExtension = updateExtension;
+let extensionUninstallCommand: typeof finalizeDevelopmentExtensionUninstall =
+  finalizeDevelopmentExtensionUninstall;
 
 interface ToolRequest {
   command: string;
   flags: Record<string, string>;
   context?: {
     channelId?: string;
+    platform?: ChatPlatform;
   };
 }
 
@@ -57,10 +81,97 @@ async function executeCommand(
 ): Promise<string> {
   if (command.startsWith('discord_') || command === 'media_send') {
     return discordApi(command, flags, context);
+  } else if (command.startsWith('slack_') && command !== 'slack_history') {
+    return slackApi(command, flags, context);
   } else if (command.startsWith('schedule_')) {
-    return scheduleCmd(command, flags);
+    return scheduleCmd(command, flags, scheduleManager ?? undefined);
   } else if (command.startsWith('system_')) {
     return systemCmd(command, flags);
+  } else if (command === 'help') {
+    return formatXangiCmdHelp(flags['topic']);
+  } else if (command === 'models') {
+    if (!backendResolver) {
+      throw new ValidationError('models is not available on this instance');
+    }
+    if (flags.use) {
+      return selectModelForNextTurn(
+        {
+          backend: flags.backend,
+          model: flags.use,
+          effort: flags.effort,
+          channelId: flags.channel ?? context?.channelId,
+        },
+        backendResolver,
+        modelDiscovery
+      );
+    }
+    return executeModelsCommand(flags.backend, backendResolver, modelDiscovery);
+  } else if (command === 'runtime_settings') {
+    if (!backendResolver || !runtimeConfig) {
+      throw new ValidationError('runtime_settings is not available on this instance');
+    }
+    return executeRuntimeSettingsCommand(
+      {
+        name: flags.name,
+        action: flags.action,
+        value: flags.value,
+        backend: flags.backend,
+        model: flags.model,
+        effort: flags.effort,
+        channelId: flags.channel ?? context?.channelId,
+        platform: flags.platform ?? context?.platform,
+      },
+      { config: runtimeConfig, resolver: backendResolver, modelDiscovery }
+    );
+  } else if (command === 'web_status') {
+    return webStatusCommand();
+  } else if (command === 'extension_runtime') {
+    if (!runtimeConfig) {
+      throw new ValidationError('extension_runtime is not available on this instance');
+    }
+    const action = flags.action as ExtensionAction | undefined;
+    if (!action || !['start', 'stop', 'restart', 'status', 'doctor'].includes(action)) {
+      throw new ValidationError('extension_runtime requires a lifecycle action');
+    }
+    const linked = await listExtensions();
+    const selected = flags.id ? linked.filter((item) => item.id === flags.id) : linked;
+    if (flags.id && selected.length === 0) {
+      throw new ValidationError(`Unknown extension: ${flags.id}`);
+    }
+    const results: string[] = [];
+    for (const item of selected) {
+      const result = await runExtensionAction(item, action, {
+        workspace: runtimeConfig.agent.config.workdir,
+      });
+      results.push(`${item.id}\t${JSON.stringify(result)}`);
+    }
+    return results.length ? results.join('\n') : 'No extensions linked';
+  } else if (command === 'extension_request') {
+    return executeExtensionRequest(flags);
+  } else if (command === 'extension_update') {
+    if (!runtimeConfig) {
+      throw new ValidationError('extension_update is not available on this instance');
+    }
+    if (!flags.id || !flags.to) {
+      throw new ValidationError('extension_update requires --id and --to');
+    }
+    const id = flags.id;
+    const targetCommitSha = flags.to;
+    const result = await extensionUpdateCommand({
+      id,
+      expectedCommitSha: targetCommitSha,
+      workspace: runtimeConfig.agent.config.workdir || process.cwd(),
+      acceptManifestChanges: flags['accept-manifest-changes'] === 'true',
+    });
+    return JSON.stringify(result);
+  } else if (command === 'extension_uninstall') {
+    if (!runtimeConfig) {
+      throw new ValidationError('extension_uninstall is not available on this instance');
+    }
+    if (!flags.id) {
+      throw new ValidationError('extension_uninstall requires --id');
+    }
+    return JSON.stringify(await extensionUninstallCommand(flags.id));
   } else if (command === 'trigger') {
     if (!eventTrigger) {
       throw new ValidationError('Trigger is not available on this instance');
@@ -76,6 +187,17 @@ async function executeCommand(
       throw new ValidationError(String(result.body.error ?? 'Trigger failed'));
     }
     return `✅ トリガーを発火しました (id: ${result.body.triggerId}, source: ${result.body.source})`;
+  } else if (command === 'trigger_status') {
+    if (!eventTrigger) {
+      throw new ValidationError('Trigger is not available on this instance');
+    }
+    const triggerId = flags.id?.trim();
+    if (!triggerId) throw new ValidationError('--id is required');
+    const result = eventTrigger.getReceipt(triggerId);
+    if (result.status >= 400) {
+      throw new ValidationError(String(result.body.error ?? 'Trigger status failed'));
+    }
+    return JSON.stringify(result.body.receipt, null, 2);
   } else if (command === 'web_history') {
     // 現ペイン解決のために context.channelId を env で渡す
     // (`web-chat:<appSessionId>` 形式)
@@ -85,6 +207,21 @@ async function executeCommand(
     }
     try {
       return webHistoryCmd(flags);
+    } finally {
+      if (previousChannel === undefined) {
+        delete process.env.XANGI_CHANNEL_ID;
+      } else {
+        process.env.XANGI_CHANNEL_ID = previousChannel;
+      }
+    }
+  } else if (command === 'slack_history') {
+    // 現Slackチャンネル解決のために context.channelId を env で渡す。
+    const previousChannel = process.env.XANGI_CHANNEL_ID;
+    if (context?.channelId) {
+      process.env.XANGI_CHANNEL_ID = context.channelId;
+    }
+    try {
+      return slackHistoryCmd(flags);
     } finally {
       if (previousChannel === undefined) {
         delete process.env.XANGI_CHANNEL_ID;
@@ -148,8 +285,25 @@ function persistToolServerPort(port: number): void {
  * options.eventTrigger を渡すと POST /api/trigger（外部イベントによる
  * エージェントターン起動）と xangi-cmd trigger が有効になる。
  */
-export function startToolServer(options?: { eventTrigger?: EventTrigger | null }): void {
+export function startToolServer(options?: {
+  eventTrigger?: EventTrigger | null;
+  backendResolver?: BackendResolver | null;
+  config?: Config | null;
+  scheduler?: Scheduler | null;
+  modelDiscovery?: typeof discoverBackendModels;
+  webStatusCommand?: typeof webStatusCmd;
+  extensionUpdateCommand?: typeof updateExtension;
+  extensionUninstallCommand?: typeof finalizeDevelopmentExtensionUninstall;
+}): void {
   eventTrigger = options?.eventTrigger ?? null;
+  backendResolver = options?.backendResolver ?? null;
+  runtimeConfig = options?.config ?? null;
+  scheduleManager = options?.scheduler ?? null;
+  modelDiscovery = options?.modelDiscovery ?? discoverBackendModels;
+  webStatusCommand = options?.webStatusCommand ?? webStatusCmd;
+  extensionUpdateCommand = options?.extensionUpdateCommand ?? updateExtension;
+  extensionUninstallCommand =
+    options?.extensionUninstallCommand ?? finalizeDevelopmentExtensionUninstall;
   server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
 
@@ -200,6 +354,27 @@ export function startToolServer(options?: { eventTrigger?: EventTrigger | null }
         res.writeHead(400);
         res.end(JSON.stringify({ ok: false, error: message }));
       }
+      return;
+    }
+
+    const triggerStatusMatch = req.url?.match(/^\/api\/trigger\/([^/?]+)$/);
+    if (triggerStatusMatch && req.method === 'GET') {
+      if (!eventTrigger) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ ok: false, error: 'Trigger is not available' }));
+        return;
+      }
+      let triggerId: string;
+      try {
+        triggerId = decodeURIComponent(triggerStatusMatch[1]);
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: 'Invalid trigger ID encoding' }));
+        return;
+      }
+      const result = eventTrigger.handleStatusHttp(triggerId, req.headers.authorization);
+      res.writeHead(result.status);
+      res.end(JSON.stringify(result.body));
       return;
     }
 
@@ -277,4 +452,6 @@ export function stopToolServer(): void {
     server = null;
     delete process.env.XANGI_TOOL_SERVER;
   }
+  runtimeConfig = null;
+  scheduleManager = null;
 }

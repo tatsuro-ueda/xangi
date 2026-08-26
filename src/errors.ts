@@ -1,3 +1,5 @@
+import { isAntigravityWorkspaceArtifactPathError } from './antigravity-output.js';
+
 /**
  * クライアント入力に起因するエラー（パラメータ不足・バリデーション失敗など）。
  * tool-server側でこの型を投げると HTTP 400 で返る。それ以外は 500（サーバー内部エラー）。
@@ -7,6 +9,27 @@ export class ValidationError extends Error {
     super(message);
     this.name = 'ValidationError';
   }
+}
+
+/**
+ * The operation failed after side effects may already have completed, so
+ * retrying the enclosing task could duplicate externally visible work.
+ */
+export class NonRetryableError extends Error {
+  readonly retryable = false;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'NonRetryableError';
+  }
+}
+
+export function isNonRetryableError(error: unknown): error is NonRetryableError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { retryable?: unknown }).retryable === false
+  );
 }
 
 /**
@@ -21,6 +44,7 @@ export type AgentErrorKind =
   | 'crash' // AI プロセスの予期しない終了
   | 'circuit-breaker' // 連続クラッシュによる一時停止
   | 'usage-limit' // バックエンドの利用上限到達（時間経過で回復）
+  | 'antigravity-artifact-path' // Agy が通常ファイルを内部 artifact と誤分類
   | 'unknown';
 
 const CANCEL_MESSAGE = 'Request cancelled by user';
@@ -29,6 +53,7 @@ const CANCEL_MESSAGE = 'Request cancelled by user';
 export function classifyAgentError(error: unknown): AgentErrorKind {
   const msg = error instanceof Error ? error.message : String(error);
   if (msg === CANCEL_MESSAGE) return 'cancelled';
+  if (isAntigravityWorkspaceArtifactPathError(error)) return 'antigravity-artifact-path';
   if (msg.includes('timed out')) return 'timeout';
   if (msg.includes('Process exited unexpectedly')) return 'crash';
   if (msg.includes('Circuit breaker')) return 'circuit-breaker';
@@ -56,6 +81,8 @@ export function formatAgentErrorForUser(error: unknown, opts?: { timeoutMs?: num
       return '🔌 AIプロセスが連続でクラッシュしたため一時停止中です。しばらくしてから再試行してください';
     case 'usage-limit':
       return `💳 バックエンドの利用上限に達しています: ${detail}`;
+    case 'antigravity-artifact-path':
+      return '❌ Agyがワークスペースへの書き込みを内部artifactと誤判定しました。自動回復にも失敗したため、もう一度お試しください';
     case 'unknown':
     default:
       return `❌ エラーが発生しました: ${detail}`;
@@ -69,10 +96,84 @@ export function formatAgentErrorForUser(error: unknown, opts?: { timeoutMs?: num
  * エージェント実行のタイムアウトや利用上限はリトライ対象にしない。
  */
 export function isTransientNetworkError(error: unknown): boolean {
-  const msg = error instanceof Error ? error.message : String(error);
-  return /EAI_AGAIN|ENOTFOUND|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ConnectTimeoutError|Connect Timeout|fetch failed|socket hang up/i.test(
-    msg
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  const parts: string[] = [];
+
+  while (pending.length > 0 && seen.size < 8) {
+    const current = pending.shift();
+    if (current === undefined || current === null || seen.has(current)) continue;
+    seen.add(current);
+
+    if (typeof current !== 'object') {
+      parts.push(String(current));
+      continue;
+    }
+
+    const record = current as Record<string, unknown>;
+    for (const field of ['message', 'code', 'errno']) {
+      if (record[field] !== undefined) parts.push(String(record[field]));
+    }
+    if (record.cause !== undefined) pending.push(record.cause);
+    if (record.error !== undefined) pending.push(record.error);
+    if (record.original !== undefined) pending.push(record.original);
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+  }
+
+  return /EAI_AGAIN|ENOTFOUND|ENETDOWN|ENETRESET|ENETUNREACH|EHOSTDOWN|EHOSTUNREACH|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ESOCKETTIMEDOUT|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_SOCKET|ConnectTimeoutError|Connect Timeout|fetch failed|socket hang up/i.test(
+    parts.join(' ')
   );
+}
+
+/**
+ * Error.cause を含む通信エラーの診断情報を、ログへ残せる短い文字列にする。
+ * Node.js の fetch は最上位を `TypeError: fetch failed` に丸めるため、cause 側の
+ * code / errno / address / port を残さないと接続拒否・reset・DNS失敗を区別できない。
+ */
+export function formatErrorDiagnostic(error: unknown): string {
+  const pending: Array<{ value: unknown; label: string }> = [{ value: error, label: 'error' }];
+  const seen = new Set<unknown>();
+  const entries: string[] = [];
+
+  while (pending.length > 0 && seen.size < 8) {
+    const current = pending.shift();
+    if (!current || current.value === undefined || current.value === null) continue;
+    if (seen.has(current.value)) continue;
+    seen.add(current.value);
+
+    if (typeof current.value !== 'object') {
+      entries.push(
+        `${current.label}=${String(current.value)
+          .replace(/[\r\n]+/g, ' ')
+          .slice(0, 300)}`
+      );
+      continue;
+    }
+
+    const record = current.value as Record<string, unknown>;
+    const fields: string[] = [];
+    for (const field of ['name', 'message', 'code', 'errno', 'syscall', 'address', 'port']) {
+      const value = record[field];
+      if (value === undefined || value === null || value === '') continue;
+      fields.push(
+        `${field}=${String(value)
+          .replace(/[\r\n]+/g, ' ')
+          .slice(0, 300)}`
+      );
+    }
+    if (fields.length > 0) entries.push(`${current.label}(${fields.join(', ')})`);
+
+    if (record.cause !== undefined) pending.push({ value: record.cause, label: 'cause' });
+    if (record.error !== undefined) pending.push({ value: record.error, label: 'nested_error' });
+    if (record.original !== undefined) {
+      pending.push({ value: record.original, label: 'original' });
+    }
+    if (Array.isArray(record.errors)) {
+      record.errors.forEach((value, index) => pending.push({ value, label: `errors[${index}]` }));
+    }
+  }
+
+  return entries.join(' <- ').slice(0, 1200) || 'unknown error';
 }
 
 /**

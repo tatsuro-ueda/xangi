@@ -5,6 +5,7 @@ import {
   mergeTexts,
   sanitizeSurrogates,
 } from '../src/agent-runner.js';
+import { installExtensionBackendFixture } from './helpers/extension-backend.js';
 
 describe('agent-runner', () => {
   describe('createAgentRunner', () => {
@@ -17,6 +18,13 @@ describe('agent-runner', () => {
 
     it('should create CodexRunner for codex backend', () => {
       const runner = createAgentRunner('codex', {});
+      expect(runner).toBeDefined();
+      expect(runner.run).toBeDefined();
+      expect(runner.runStream).toBeDefined();
+    });
+
+    it('should create OpenCodeRunner for opencode backend', () => {
+      const runner = createAgentRunner('opencode', {});
       expect(runner).toBeDefined();
       expect(runner.run).toBeDefined();
       expect(runner.runStream).toBeDefined();
@@ -38,6 +46,21 @@ describe('agent-runner', () => {
 
     it('should create AntigravityRunner for antigravity backend', () => {
       const runner = createAgentRunner('antigravity', {});
+      expect(runner).toBeDefined();
+      expect(runner.run).toBeDefined();
+      expect(runner.runStream).toBeDefined();
+    });
+
+    it('should create a generic runner for a linked extension backend', async () => {
+      await installExtensionBackendFixture();
+      const runner = createAgentRunner('example-backend', {});
+      expect(runner).toBeDefined();
+      expect(runner.run).toBeDefined();
+      expect(runner.runStream).toBeDefined();
+    });
+
+    it('should create GitHubCopilotRunner for github-copilot backend', () => {
+      const runner = createAgentRunner('github-copilot', {});
       expect(runner).toBeDefined();
       expect(runner.run).toBeDefined();
       expect(runner.runStream).toBeDefined();
@@ -149,6 +172,10 @@ describe('agent-runner', () => {
       expect(getBackendDisplayName('codex')).toBe('Codex');
     });
 
+    it('should return "OpenCode" for opencode', () => {
+      expect(getBackendDisplayName('opencode')).toBe('OpenCode');
+    });
+
     it('should return "Cursor" for cursor', () => {
       expect(getBackendDisplayName('cursor')).toBe('Cursor');
     });
@@ -159,6 +186,15 @@ describe('agent-runner', () => {
 
     it('should return "Antigravity" for antigravity', () => {
       expect(getBackendDisplayName('antigravity')).toBe('Antigravity');
+    });
+
+    it('should use the extension backend display name', async () => {
+      await installExtensionBackendFixture();
+      expect(getBackendDisplayName('example-backend')).toBe('Example backend');
+    });
+
+    it('should return "GitHub Copilot" for github-copilot', () => {
+      expect(getBackendDisplayName('github-copilot')).toBe('GitHub Copilot');
     });
   });
 });

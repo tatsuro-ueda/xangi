@@ -14,18 +14,35 @@
  * このパターンが見つかったら Step C で LLM に feedback して retry を要求する
  * (実応答が欠けてる/置き換えられてる可能性が高いため)。
  */
-const STRICT_DRIFT_PATTERNS: RegExp[] = [
+const COMPLETE_STRICT_DRIFT_PATTERNS: RegExp[] = [
+  // Step/Qwen 系 chat template の XML tool call（OpenAI 互換サーバが
+  // tool_choice='none' を無視したときに text content として漏れる）
+  /<tool_call>\s*<function=[^>]+>[\s\S]*?<\/function>\s*<\/tool_call>/g,
+  // streaming 抑止が開きタグだけ先に除去した場合の孤立断片
+  /<function=[^>]+>[\s\S]*?<\/function>\s*<\/tool_call>/g,
   // Harmony channel タグ (open + 中身 + close、close 形式の揺れ対応)
   /<\|channel\|?>[\s\S]*?<\|?\/?channel\|?>/g,
   // 擬似 tool_call タグ (open/close 揺れ)
   /<\|tool_call\|?>[\s\S]*?<\|?\/?tool_call\|?>/g,
-  // open のみで close が来ない (stream 途中 or 不完全) パターン
-  /<\|channel\|?>[\s\S]*$/,
-  /<\|tool_call\|?>[\s\S]*$/,
   // thought\ncall:fn{args} の bare 形式 (タグ無しで直接漏れる場合)
   /^thought\s*\n+call:\w+\s*\{[^}]*\}\s*$/gm,
   // 単独行の call:fn{args}
   /^\s*call:\w+\s*\{[^}]*\}\s*$/gm,
+];
+
+// 最終応答では close 不在の残骸も drift として検出・除去する。
+// streaming 中にこれらを drop すると開きタグだけ失われるため、
+// StreamingDriftBuffer は COMPLETE_STRICT_DRIFT_PATTERNS だけを drop に使う。
+const INCOMPLETE_STRICT_DRIFT_PATTERNS: RegExp[] = [
+  /<\|channel\|?>[\s\S]*$/,
+  /<\|tool_call\|?>[\s\S]*$/,
+  /<tool_call>[\s\S]*$/,
+  /<function=[^>]+>[\s\S]*$/,
+];
+
+const STRICT_DRIFT_PATTERNS: RegExp[] = [
+  ...COMPLETE_STRICT_DRIFT_PATTERNS,
+  ...INCOMPLETE_STRICT_DRIFT_PATTERNS,
 ];
 
 /**
@@ -116,6 +133,29 @@ const PSEUDO_TOOLCALL_PARSE_PATTERNS: RegExp[] = [
   /^\s*call:(\w+)\s*\{([^}]*)\}\s*$/m,
 ];
 
+/** Step/Qwen 系 XML tool call の厳密な全体パース。 */
+function parseXmlPseudoToolCall(
+  text: string
+): { name: string; args: Record<string, unknown> } | null {
+  const outer =
+    /^\s*(?:<tool_call>\s*)?<function=([a-zA-Z_][a-zA-Z0-9_.:-]*)>\s*([\s\S]*?)\s*<\/function>\s*(?:<\/tool_call>)?\s*$/.exec(
+      text
+    );
+  if (!outer) return null;
+
+  const args: Record<string, unknown> = {};
+  const body = outer[2];
+  const parameterPattern = /<parameter=([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/parameter>/g;
+  let match: RegExpExecArray | null;
+  while ((match = parameterPattern.exec(body)) !== null) {
+    if (Object.hasOwn(args, match[1])) return null;
+    args[match[1]] = match[2].trim();
+  }
+  // parameter 以外の未知な本文を含む場合は安全側で parse 失敗にする。
+  if (body.replace(parameterPattern, '').trim() !== '') return null;
+  return { name: outer[1], args };
+}
+
 /**
  * 擬似 tool_call args の tolerant parser。
  * Gemma 4 が吐く形式は厳密な JSON ではなく、unquoted key/value が混じる:
@@ -172,6 +212,8 @@ function parsePseudoArgs(body: string): Record<string, unknown> | null {
 export function parsePseudoToolCall(
   text: string
 ): { name: string; args: Record<string, unknown> } | null {
+  const xmlCall = parseXmlPseudoToolCall(text);
+  if (xmlCall) return xmlCall;
   for (const pattern of PSEUDO_TOOLCALL_PARSE_PATTERNS) {
     const m = pattern.exec(text);
     if (m) {
@@ -187,7 +229,7 @@ export function parsePseudoToolCall(
 
 /**
  * 擬似 tool_call を救済実行してよいかの安全判定 (allowlist)。
- * 副作用のないツール / 副作用のない xangi-cmd サブコマンドだけ救済対象にする。
+ * 副作用のないツール / 副作用のない xangi tool サブコマンドだけ救済対象にする。
  *
  * denylist 方式 (例えば `rm/curl/git` を弾く) は抜け道が多いため使わない。allowlist で
  * 安全なツール/サブコマンドのみを明示的に許可する。`exec` 系は shell metacharacter
@@ -199,8 +241,12 @@ const READ_ONLY_RESCUE_TOOLS = new Set([
   'grep',
   'tool_search',
   'discord_history',
+  'discord_message',
   'web_history',
+  'web_status',
   'slack_history',
+  'slack_channels',
+  'slack_search',
   'discord_channels',
   'discord_search',
   'schedule_list',
@@ -208,12 +254,18 @@ const READ_ONLY_RESCUE_TOOLS = new Set([
 
 const SAFE_XANGI_SUBCOMMANDS = new Set([
   'discord_history',
+  'discord_message',
   'web_history',
+  'web_status',
   'slack_history',
+  'slack_channels',
+  'slack_search',
   'discord_channels',
   'discord_search',
   'schedule_list',
   'system_settings',
+  'models',
+  'help',
 ]);
 
 const SHELL_METACHAR_PATTERN = /[|&;`$<>]/;
@@ -246,19 +298,22 @@ export function isSafeForRescue(name: string, args: Record<string, unknown>): Sa
           'shell metacharacters (pipe/redirect/&&/;/$()/backtick) detected — not safe to rescue',
       };
     }
-    const match = cmd.match(/^xangi-cmd\s+([a-z_]+)/);
+    const match = cmd.match(/^(?:xangi\s+tool|xangi-cmd)\s+([a-z_]+)/);
     if (match && SAFE_XANGI_SUBCOMMANDS.has(match[1])) {
+      if (match[1] === 'models' && /(?:^|\s)--use(?:\s|$)/.test(cmd)) {
+        return { safe: false, reason: 'models --use changes the next-turn model' };
+      }
       return { safe: true };
     }
     return {
       safe: false,
-      reason: `exec command not in rescue allowlist (only xangi-cmd ${[...SAFE_XANGI_SUBCOMMANDS].join('/')} allowed)`,
+      reason: `exec command not in rescue allowlist (only xangi tool ${[...SAFE_XANGI_SUBCOMMANDS].join('/')} allowed)`,
     };
   }
 
   return {
     safe: false,
-    reason: `tool '${name}' is not in rescue allowlist (read-only tools and safe xangi-cmd subcommands only)`,
+    reason: `tool '${name}' is not in rescue allowlist (read-only tools and safe xangi tool subcommands only)`,
   };
 }
 
@@ -307,8 +362,12 @@ Use this information to make your next attempt. Do NOT copy or echo this JSON in
  * 分かる文字 (改行で文を完結している等) が来てから release する。
  */
 const PARTIAL_DRIFT_TAIL_PATTERNS: RegExp[] = [
-  /<\|channel[^>]*$/,
-  /<\|tool_call[^>]*$/,
+  // open を検出したら close が来るまでブロック全体を hold する。
+  // `[^>]*$` だけでは開きタグの `>` 到着直後に残りを release してしまう。
+  /<tool_call(?:>[\s\S]*)?$/,
+  /<function=[^>]*(?:>[\s\S]*)?$/,
+  /<\|channel(?:\|?>[\s\S]*)?$/,
+  /<\|tool_call(?:\|?>[\s\S]*)?$/,
   /(?:^|\n)thought\s*\n*\s*$/,
   /(?:^|\n)\s*call:\w*\{[^}]*$/,
   /(?:^|\n)\s*call:\w*$/,
@@ -343,7 +402,7 @@ export class StreamingDriftBuffer {
 
     // 1. 完全な strict drift パターンを除去 (drop 検出)
     let dropped = false;
-    for (const pattern of STRICT_DRIFT_PATTERNS) {
+    for (const pattern of COMPLETE_STRICT_DRIFT_PATTERNS) {
       const re = new RegExp(pattern.source, pattern.flags);
       if (re.test(this.buf)) {
         this.buf = this.buf.replace(re, '');
@@ -359,6 +418,21 @@ export class StreamingDriftBuffer {
       if (match && match.index >= 0) {
         if (earliestPartialIdx === -1 || match.index < earliestPartialIdx) {
           earliestPartialIdx = match.index;
+        }
+      }
+    }
+
+    // marker 自体が chunk 境界で分割された場合も、末尾の接頭辞を hold する。
+    // 例: "<tool" + "_call>" / "<" + "function=exec>"
+    const markerPrefixes = ['<tool_call', '<function=', '<|channel', '<|tool_call'];
+    for (const marker of markerPrefixes) {
+      for (let length = 1; length < marker.length; length++) {
+        const prefix = marker.slice(0, length);
+        if (this.buf.endsWith(prefix)) {
+          const index = this.buf.length - length;
+          if (earliestPartialIdx === -1 || index < earliestPartialIdx) {
+            earliestPartialIdx = index;
+          }
         }
       }
     }

@@ -1,4 +1,6 @@
 import { EventEmitter } from 'events';
+import { realpathSync } from 'fs';
+import { resolve as resolvePath } from 'path';
 import type {
   AgentRunner,
   RunOptions,
@@ -16,8 +18,14 @@ import {
   getActiveSessionId,
   getSessionEntry,
   setProviderSessionId,
+  setProviderSessionMode,
 } from './sessions.js';
 import type { ChatPlatform } from './prompts/index.js';
+import {
+  appendUserPromptSubmitContext,
+  createReloadingUserPromptSubmitHookRunner,
+  type ReloadingUserPromptSubmitHookRunner,
+} from './hooks.js';
 
 /**
  * チャンネルごとにバックエンドを動的に切り替えるランナーマネージャー
@@ -33,6 +41,8 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   private resolver: BackendResolver;
   private config: Config;
   private platform?: ChatPlatform;
+  private readonly workdir: string;
+  private readonly userPromptSubmitHooks: ReloadingUserPromptSubmitHookRunner | null;
 
   /** デフォルトのランナー（.env設定ベース） */
   private defaultRunner: AgentRunner;
@@ -45,6 +55,8 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     this.config = config;
     this.resolver = resolver;
     this.platform = config.agent.platform;
+    this.workdir = config.agent.config.workdir || process.cwd();
+    this.userPromptSubmitHooks = createReloadingUserPromptSubmitHookRunner(this.workdir);
 
     // デフォルトランナーを作成
     this.defaultRunner = createAgentRunner(config.agent.backend, config.agent.config, {
@@ -79,10 +91,19 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   private getRunner(
     channelId: string | undefined,
     resolved: ResolvedBackend,
-    platform?: ChatPlatform
+    platform?: ChatPlatform,
+    workdir?: string,
+    forceDedicated = false
   ): AgentRunner {
     const runnerPlatform = platform ?? this.platform;
-    if (!channelId) return this.defaultRunner;
+    const defaultWorkdir = canonicalizeWorkdir(this.config.agent.config.workdir ?? process.cwd());
+    const requestedWorkdir = canonicalizeWorkdir(workdir ?? defaultWorkdir);
+    if (!channelId) {
+      if (requestedWorkdir !== defaultWorkdir) {
+        throw new Error('A channelId is required when running in a non-default workspace');
+      }
+      return this.defaultRunner;
+    }
 
     // デフォルトと同じなら共有ランナーを使用
     const resolverKey = this.makeKey(resolved);
@@ -90,7 +111,13 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     const platformKey = runnerPlatform ?? 'all';
     const defaultPlatformKey = this.platform ?? 'all';
 
-    if (resolverKey === defaultKey && !resolved.effort && platformKey === defaultPlatformKey) {
+    if (
+      resolverKey === defaultKey &&
+      !resolved.effort &&
+      platformKey === defaultPlatformKey &&
+      requestedWorkdir === defaultWorkdir &&
+      !forceDedicated
+    ) {
       // チャンネル用の別ランナーがあれば破棄
       this.destroyChannelRunner(channelId);
       return this.defaultRunner;
@@ -98,7 +125,7 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
 
     // 既存のチャンネルランナーがあり、キーが一致すればそれを使う
     const existing = this.channelRunners.get(channelId);
-    const channelRunnerKey = `${resolverKey}:${platformKey}:${resolved.effort ?? ''}`;
+    const channelRunnerKey = `${resolverKey}:${platformKey}:${resolved.effort ?? ''}:${requestedWorkdir}`;
     if (existing && existing.key === channelRunnerKey) {
       return existing.runner;
     }
@@ -107,7 +134,7 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     this.destroyChannelRunner(channelId);
 
     // 新しいランナーを作成
-    const runner = this.createRunnerFor(resolved, runnerPlatform, channelId);
+    const runner = this.createRunnerFor(resolved, runnerPlatform, requestedWorkdir);
     this.attachTimeoutBubble(runner);
     this.channelRunners.set(channelId, {
       runner,
@@ -118,7 +145,7 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
       `[dynamic-runner] Created channel runner for ${channelId}: ${getBackendDisplayName(resolved.backend)}` +
         (resolved.model ? ` (${resolved.model})` : '') +
         (resolved.effort ? ` effort=${resolved.effort}` : '') +
-        ` platform=${platformKey}`
+        ` platform=${platformKey} workdir=${requestedWorkdir}`
     );
 
     return runner;
@@ -130,11 +157,12 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   private createRunnerFor(
     resolved: ResolvedBackend,
     platform?: ChatPlatform,
-    _channelId?: string
+    workdir?: string
   ): AgentRunner {
     const agentConfig: AgentConfig = {
       ...this.config.agent.config,
       model: resolved.model,
+      workdir: workdir ?? this.config.agent.config.workdir,
     };
 
     // claude-code persistent モード: effort付きの専用RunnerManagerを作成
@@ -177,8 +205,16 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
    */
   async run(prompt: string, options?: RunOptions): Promise<RunResult> {
     const channelId = options?.channelId;
-    const resolved = this.resolver.resolve(channelId, this.getRequestDefault(options));
-    const runner = this.getRunner(channelId, resolved, options?.platform);
+    const settingsChannelId = options?.settingsChannelId ?? channelId;
+    const resolved = this.resolver.resolve(settingsChannelId, this.getRequestDefault(options));
+    this.recordResolvedSessionMode(options, resolved);
+    const runner = this.getRunner(
+      options?.runnerKey ?? channelId,
+      resolved,
+      options?.platform,
+      options?.workdir,
+      options?.runnerKey !== undefined && options.runnerKey !== channelId
+    );
 
     // effort / localLlmMode をオプションに注入（resolved 由来）
     const runOptions = this.injectResolvedFields(
@@ -186,7 +222,8 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
       resolved
     );
 
-    const result = await runner.run(prompt, runOptions);
+    const enrichedPrompt = await this.applyUserPromptSubmitHooks(prompt, runOptions);
+    const result = await runner.run(enrichedPrompt, runOptions);
     this.recordResolvedBackend(runOptions, resolved, result);
     return result;
   }
@@ -200,17 +237,49 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     options?: RunOptions
   ): Promise<RunResult> {
     const channelId = options?.channelId;
-    const resolved = this.resolver.resolve(channelId, this.getRequestDefault(options));
-    const runner = this.getRunner(channelId, resolved, options?.platform);
+    const settingsChannelId = options?.settingsChannelId ?? channelId;
+    const resolved = this.resolver.resolve(settingsChannelId, this.getRequestDefault(options));
+    this.recordResolvedSessionMode(options, resolved);
+    const runner = this.getRunner(
+      options?.runnerKey ?? channelId,
+      resolved,
+      options?.platform,
+      options?.workdir,
+      options?.runnerKey !== undefined && options.runnerKey !== channelId
+    );
 
     const runOptions = this.injectResolvedFields(
       this.dropMismatchedProviderSession(options, resolved),
       resolved
     );
 
-    const result = await runner.runStream(prompt, callbacks, runOptions);
+    const enrichedPrompt = await this.applyUserPromptSubmitHooks(prompt, runOptions);
+    const result = await runner.runStream(enrichedPrompt, callbacks, runOptions);
     this.recordResolvedBackend(runOptions, resolved, result);
     return result;
+  }
+
+  private async applyUserPromptSubmitHooks(
+    prompt: string,
+    options: RunOptions | undefined
+  ): Promise<string> {
+    const rawUserText = options?.userText;
+    if (!this.userPromptSubmitHooks || !rawUserText) return prompt;
+
+    const contexts = await this.userPromptSubmitHooks.run({
+      hook_event_name: 'UserPromptSubmit',
+      session_id:
+        options.appSessionId ||
+        options.sessionId ||
+        options.channelId ||
+        options.settingsChannelId ||
+        '',
+      cwd: this.workdir,
+      prompt: rawUserText,
+      channel_id: options.channelId,
+      platform: options.platform ?? this.platform,
+    });
+    return appendUserPromptSubmitContext(prompt, contexts);
   }
 
   private dropMismatchedProviderSession(
@@ -222,22 +291,48 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     const appSessionId = options.appSessionId || getActiveSessionId(options.channelId);
     const entry = appSessionId ? getSessionEntry(appSessionId) : undefined;
     const storedBackend = entry?.agent?.backend;
-    if (!storedBackend || storedBackend === resolved.backend) return options;
+    const defaultWorkdir = canonicalizeWorkdir(this.config.agent.config.workdir ?? process.cwd());
+    const requestedWorkdir = canonicalizeWorkdir(options.workdir ?? defaultWorkdir);
+    const storedWorkdir = entry
+      ? canonicalizeWorkdir(entry.workspacePath ?? defaultWorkdir)
+      : undefined;
+
+    const storedModel = entry?.agent?.model;
+    const storedEffort = entry?.agent?.effort;
+    const backendConfigurationMatches =
+      !storedBackend ||
+      (storedBackend === resolved.backend &&
+        storedModel === resolved.model &&
+        storedEffort === resolved.effort);
+    const matchesResolvedConfiguration =
+      backendConfigurationMatches && (!storedWorkdir || storedWorkdir === requestedWorkdir);
+    if (matchesResolvedConfiguration) return options;
 
     console.warn(
-      `[dynamic-runner] Ignoring ${storedBackend} provider session for ${options.channelId}; resolved backend is ${resolved.backend}`
+      `[dynamic-runner] Ignoring provider session for ${options.channelId}; ` +
+        `stored=${storedBackend}:${storedModel ?? 'default'}:${storedEffort ?? 'default'}, ` +
+        `resolved=${resolved.backend}:${resolved.model ?? 'default'}:${resolved.effort ?? 'default'}, ` +
+        `storedWorkdir=${storedWorkdir ?? 'legacy'}, requestedWorkdir=${requestedWorkdir}`
     );
     return { ...options, sessionId: undefined };
   }
 
   private getRequestDefault(options: RunOptions | undefined) {
-    if (!options?.defaultBackend && !options?.defaultModel && !options?.defaultLocalLlmMode) {
+    if (
+      !options?.defaultBackend &&
+      !options?.defaultModel &&
+      !options?.defaultEffort &&
+      !options?.defaultLocalLlmMode &&
+      !options?.defaultLocalLlmReasoningEffort
+    ) {
       return undefined;
     }
     return {
       backend: options.defaultBackend,
       model: options.defaultModel,
+      effort: options.defaultEffort,
       localLlmMode: options.defaultLocalLlmMode,
+      localLlmReasoningEffort: options.defaultLocalLlmReasoningEffort,
     };
   }
 
@@ -247,11 +342,46 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     result: RunResult
   ): void {
     if (!options?.appSessionId || !result.sessionId) return;
-    setProviderSessionId(options.appSessionId, result.sessionId, resolved.backend);
+    if (!this.sessionWorkdirMatches(options, options.appSessionId)) {
+      console.warn(
+        `[dynamic-runner] Not storing provider session for ${options.appSessionId}; ` +
+          'the requested workspace differs from its immutable session snapshot'
+      );
+      return;
+    }
+    setProviderSessionId(
+      options.appSessionId,
+      result.sessionId,
+      resolved.backend,
+      resolved.model,
+      resolved.effort,
+      result.sessionMode
+    );
+  }
+
+  private sessionWorkdirMatches(options: RunOptions, appSessionId: string): boolean {
+    const entry = getSessionEntry(appSessionId);
+    if (!entry) return true;
+    const defaultWorkdir = canonicalizeWorkdir(this.config.agent.config.workdir ?? process.cwd());
+    const requestedWorkdir = canonicalizeWorkdir(options.workdir ?? defaultWorkdir);
+    const storedWorkdir = canonicalizeWorkdir(entry.workspacePath ?? defaultWorkdir);
+    return storedWorkdir === requestedWorkdir;
+  }
+
+  private recordResolvedSessionMode(
+    options: RunOptions | undefined,
+    resolved: ResolvedBackend
+  ): void {
+    if (!options?.appSessionId) return;
+    setProviderSessionMode(
+      options.appSessionId,
+      resolved.backend,
+      resolved.sessionMode ?? 'stateful'
+    );
   }
 
   /**
-   * resolved の effort / localLlmMode を RunOptions にマージする
+   * resolved の effort / Local LLM設定を RunOptions にマージする
    * - 既存 options に明示的に指定があればそれを優先
    * - resolved.localLlmMode は Local LLM 以外のバックエンドでは無視されるが、害はない
    */
@@ -261,11 +391,17 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   ): RunOptions | undefined {
     const hasEffort = resolved.effort && (!options || options.effort === undefined);
     const hasMode = resolved.localLlmMode && (!options || options.localLlmMode === undefined);
-    if (!hasEffort && !hasMode) return options;
+    const hasLocalLlmReasoningEffort =
+      resolved.localLlmReasoningEffort &&
+      (!options || options.localLlmReasoningEffort === undefined);
+    if (!hasEffort && !hasMode && !hasLocalLlmReasoningEffort) return options;
     return {
       ...options,
       ...(hasEffort && { effort: resolved.effort }),
       ...(hasMode && { localLlmMode: resolved.localLlmMode }),
+      ...(hasLocalLlmReasoningEffort && {
+        localLlmReasoningEffort: resolved.localLlmReasoningEffort,
+      }),
     };
   }
 
@@ -300,7 +436,10 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
    * 指定チャンネルのランナーがプールに存在するか
    */
   hasRunner(channelId: string): boolean {
-    if (this.channelRunners.has(channelId)) return true;
+    const channelEntry = this.channelRunners.get(channelId);
+    if (channelEntry) {
+      return channelEntry.runner.hasRunner?.(channelId) ?? false;
+    }
     return this.defaultRunner.hasRunner?.(channelId) ?? false;
   }
 
@@ -394,5 +533,14 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     ) {
       (this.defaultRunner as RunnerManager).shutdown();
     }
+  }
+}
+
+function canonicalizeWorkdir(workdir: string): string {
+  const absolute = resolvePath(workdir);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
   }
 }

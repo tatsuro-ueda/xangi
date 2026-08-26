@@ -1,3 +1,5 @@
+[English](en/discord-setup.md) | 日本語
+
 # Discord Bot セットアップガイド
 
 xangi を Discord で使用するための Bot 作成手順。
@@ -26,11 +28,11 @@ Discord アカウントでログイン。
 
 同じ Bot ページで **Privileged Gateway Intents** を設定：
 
-| Intent | 必須 | 説明 |
-|--------|------|------|
-| Presence Intent | 任意 | ユーザーのオンライン状態取得 |
-| Server Members Intent | 任意 | サーバーメンバー情報取得 |
-| **Message Content Intent** | **必須** | メッセージ内容の読み取り |
+| Intent                     | 必須     | 説明                         |
+| -------------------------- | -------- | ---------------------------- |
+| Presence Intent            | 任意     | ユーザーのオンライン状態取得 |
+| Server Members Intent      | 任意     | サーバーメンバー情報取得     |
+| **Message Content Intent** | **必須** | メッセージ内容の読み取り     |
 
 **⚠️ Message Content Intent を ON にしないとメッセージが読めない！**
 
@@ -41,28 +43,31 @@ Discord アカウントでログイン。
    - ✅ `bot`
    - ✅ `applications.commands`（スラッシュコマンド用）
 3. **BOT PERMISSIONS** で選択：
-   - ✅ Send Messages
-   - ✅ Send Messages in Threads
-   - ✅ Read Message History
-   - ✅ Add Reactions
-   - ✅ Use Slash Commands
+   - ✅ メッセージを送る（Send Messages）
+   - ✅ Threadsでメッセージを送る（Send Messages in Threads）
+   - ✅ スレッドを管理（Manage Threads。スレッド内の`Close`ボタンで押下者を退出させる場合は必須）
+   - ✅ メッセージ履歴を読む（Read Message History）
+   - ✅ ファイルを添付（Attach Files。生成ファイルを送信する場合）
+   - ✅ リアクションを付ける（Add Reactions）
+   - ✅ スラッシュコマンドを使用（Use Slash Commands）
 4. 生成された URL をコピー
 5. ブラウザで URL を開き、Bot を招待するサーバーを選択
 
-## 6. 環境変数を設定
+既にBotを招待済みのサーバーで権限を追加した場合は、生成したURLで再認可するか、サーバー設定のBotロール／対象チャンネル権限に直接反映する。URL Generatorでチェックしただけでは、既存Botの権限は更新されない。
+
+## 6. トークンを設定
 
 ```bash
-# .env を編集
-cp .env.example .env
-vim .env
+xangi settings
 ```
 
-```bash
-# Discord Bot Token
-DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE
+開いたローカル設定画面のDiscord欄へBotトークンを貼り付けて保存する。AIとの会話や`.env`へトークンを貼り付ける必要はない。
 
+source checkoutで詳細設定を行う場合、許可ユーザーIDなど機密ではない値は`.env`へ設定できる。
+
+```bash
 # 許可するユーザーID（1人のみ）
-ALLOWED_USER=YOUR_DISCORD_USER_ID
+DISCORD_ALLOWED_USER=YOUR_DISCORD_USER_ID
 ```
 
 ## 7. 動作確認
@@ -72,13 +77,14 @@ ALLOWED_USER=YOUR_DISCORD_USER_ID
 npm run build
 
 # Docker で起動
-docker compose up -d --build
+docker compose up xangi -d --build
 
 # ログ確認
-docker logs -f xangi
+docker compose logs -f xangi
 ```
 
-Discord サーバーで `/new` や `/skills` を試す、または Bot をメンションして話しかける：
+Discord サーバーで `/new` や `/skill` を試す、または Bot をメンションして話しかける：
+
 ```
 @xangi こんにちは！
 ```
@@ -103,7 +109,7 @@ Discord サーバーで `/new` や `/skills` を試す、または Bot をメン
 
 1. **Message Content Intent** が ON になっているか確認
 2. Bot がサーバーに招待されているか確認
-3. `ALLOWED_USER` が正しく設定されているか確認
+3. `DISCORD_ALLOWED_USER` が正しく設定されているか確認
 
 ### スラッシュコマンドが表示されない
 
@@ -113,10 +119,14 @@ Discord サーバーで `/new` や `/skills` を試す、または Bot をメン
 
 ### 「Discord token not configured」エラー
 
-`.env` の `DISCORD_TOKEN` が空になっている。トークンを設定する。
+`xangi settings`を開き、Discordが「設定済み」になっているか確認する。
+
+### スレッド内の`Close`ボタンで退出できない
+
+Botのロールまたは対象チャンネルで「スレッドの管理」権限を有効にする。権限がない場合、Discord APIは `Missing Access` または `Missing Permissions` を返す。
 
 ## セキュリティ注意事項
 
-- **トークンを Git にコミットしない**（`.gitignore` に `.env` を追加済み）
+- **トークンをGitやAIとの会話へ貼り付けない**
 - **トークンを公開しない**（漏洩した場合は即座に再生成）
-- `ALLOWED_USER` で使用できるユーザーを1人に制限（Claude Code 利用規約遵守）
+- `DISCORD_ALLOWED_USER` で使用できるユーザーを1人に制限（Claude Code 利用規約遵守）

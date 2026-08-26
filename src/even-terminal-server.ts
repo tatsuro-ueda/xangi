@@ -9,7 +9,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { AgentRunner } from './agent-runner.js';
-import type { AgentBackend } from './config.js';
+import { getAllAgentBackends, type AgentBackend } from './config.js';
 import type { LocalLlmMode } from './backend-resolver.js';
 import {
   WEB_CHAT_CONTEXT_PREFIX,
@@ -26,28 +26,22 @@ import {
 import { threadIdFor, turnIdFor, subscribeEvents } from './events-emitter.js';
 import type { PublishedEvent } from './events-emitter.js';
 import { runWithBubbleEvents } from './bubble-events-runner.js';
+import { getActivity } from './activity-store.js';
 import { flowFromHostPlatform } from './inter-instance-chat/index.js';
 import { isLocalOrPrivate } from './pet-inbox-server.js';
 import { readSessionMessages } from './transcript-logger.js';
+import { truncateSessionTitle } from './session-title.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_MESSAGES_PER_SESSION = 500;
 const MAX_TERMINAL_TEXT_CHARS = Number(process.env.XANGI_EVEN_TERMINAL_MAX_CHARS) || 400;
 const SUPPORTED_PROVIDERS = new Set(['claude', 'codex']);
-const SUPPORTED_BACKENDS = new Set<AgentBackend>([
-  'claude-code',
-  'codex',
-  'cursor',
-  'grok',
-  'antigravity',
-  'local-llm',
-]);
-const SUPPORTED_LOCAL_LLM_MODES = new Set<LocalLlmMode>(['agent', 'lite', 'chat']);
+const SUPPORTED_LOCAL_LLM_MODES = new Set<LocalLlmMode>(['agent', 'chat']);
 
 function readEvenTerminalBackend(): AgentBackend | undefined {
   const value = process.env.XANGI_EVEN_TERMINAL_BACKEND?.trim();
   if (!value) return undefined;
-  if (SUPPORTED_BACKENDS.has(value as AgentBackend)) return value as AgentBackend;
+  if (getAllAgentBackends().includes(value)) return value;
   console.warn(`[even-terminal] Ignoring invalid XANGI_EVEN_TERMINAL_BACKEND=${value}`);
   return undefined;
 }
@@ -467,7 +461,7 @@ async function handlePrompt(
             setSession(ctxKey, completedResult.sessionId);
             incrementMessageCount(appSessionId);
             if (isEvenTerminalPlaceholderTitle(entry.title)) {
-              updateSessionTitle(appSessionId, text.slice(0, 50));
+              updateSessionTitle(appSessionId, truncateSessionTitle(text));
             }
             flowFromHostPlatform(completedResult.result, 'agent');
           },
@@ -558,17 +552,21 @@ function listTerminalSessions(provider: 'claude' | 'codex', limit: number): unkn
     .map((s) => {
       const terminal = getTerminalSession(s.id);
       const summary = summarizeTerminalHistory(s.id, terminal.status);
+      const activity = getActivity(threadIdFor('web', s.id));
       return {
         id: s.id,
         title: s.title || s.id,
         cwd: process.env.WORKSPACE_PATH || process.cwd(),
         timestamp: s.updatedAt,
-        status: summary.status,
+        status: activity?.active ? activity.state : summary.status,
         provider,
         messageCount: summary.messageCount,
-        lastMessage: summary.lastMessage,
+        lastMessage: activity?.active ? activity.summary : summary.lastMessage,
         lastRole: summary.lastRole,
         updatedAt: s.updatedAt,
+        activityState: activity?.state,
+        activitySummary: activity?.summary,
+        activityElapsedSec: activity?.elapsedSec,
       };
     });
   return all;

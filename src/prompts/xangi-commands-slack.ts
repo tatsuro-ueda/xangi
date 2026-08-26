@@ -1,7 +1,5 @@
-/**
- * Slack専用のxangiコマンド
- */
-export const XANGI_COMMANDS_SLACK = `## Slack操作
+export const XANGI_COMMANDS_SLACK = `## Slack固有ルール
 
-Slackではスレッド内で会話が継続されます。
-メンションまたは専用チャンネルでメッセージを送ってください。`;
+- Slack操作は必要時に xangi tool help slack または xangi tool help <command> で確認する
+- SlackチャンネルIDを discord_* へ渡さない
+- Slackのメッセージ指定にはDiscord message IDではなく ts を使う`;

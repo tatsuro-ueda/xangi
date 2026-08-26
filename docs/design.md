@@ -1,10 +1,12 @@
+[English](en/design.md) | 日本語
+
 # 設計ドキュメント
 
 xangiのアーキテクチャと設計思想について説明します。
 
 ## 概要
 
-xangiは「AI CLI（Claude Code / Codex CLI / Cursor CLI / Grok CLI）やローカルLLM（Ollama等）をチャットプラットフォームから使えるようにするラッパー」です。
+xangiは「AI CLI（Claude Code / Codex CLI / OpenCode / Cursor CLI / Grok CLI / Antigravity CLI / GitHub Copilot CLI）やローカルLLM（Ollama等）をチャットプラットフォームから使えるようにするラッパー」です。
 
 ```
 User → Chat (Discord/Slack) → xangi → AI CLI → Workspace
@@ -14,34 +16,32 @@ User → Chat (Discord/Slack) → xangi → AI CLI → Workspace
 
 ```mermaid
 flowchart LR
-    User([ユーザー]) <-->|メッセージ| chat[UI<br/>Discord / Slack<br/>ブラウザ / LINE]
-    chat <-->|プロンプト| xangi[xangi]
-    xangi <-->|実行| LLM{{LLMバックエンド<br/>Claude Code / Codex<br/>Cursor CLI / Grok CLI<br/>Local LLM}}
-    LLM <-->|ファイル操作| WS[(Workspace<br/>AGENTS.md / skills<br/>ローカル資料)]
-    LLM <--> Web[Web検索]
-    LLM <--> Service[Webサービス]
-    xangi -->|定期実行| Scheduler
-    Scheduler -->|プロンプト| LLM
+    User([ユーザー]) <-->|メッセージ| Platform[チャットプラットフォーム]
+    Platform <-->|プロンプト / 応答| xangi[xangi]
+    xangi <-->|実行| Backend{{エージェントバックエンド}}
+    Backend <-->|読み書き| WS[(ワークスペース)]
+    Backend <--> External[外部情報 / Webサービス]
+    Scheduler[[スケジューラー / イベントトリガー]] -->|プロンプト| xangi
 
     classDef user fill:#fef3c7,stroke:#d97706,color:#111;
     classDef core fill:#dbeafe,stroke:#1e40af,color:#111;
     classDef ws fill:#fef9c3,stroke:#a16207,color:#111;
     classDef ext fill:#f3f4f6,stroke:#6b7280,color:#111;
     class User user;
-    class chat,xangi,LLM,Scheduler core;
+    class Platform,xangi,Backend,Scheduler core;
     class WS ws;
-    class Web,Service ext;
+    class External ext;
 ```
 
 ### レイヤー構成
 
-| レイヤー | 役割 | 実装 |
-|----------|------|------|
-| Chat | ユーザーインターフェース | discord.js, @slack/bolt, http (Web Chat), @line/bot-sdk |
-| xangi | AI CLI / Local LLM の統合・制御 | runner-manager.ts, dynamic-runner.ts, agent-runner.ts |
-| Backend Resolution | チャンネル別バックエンド解決 | backend-resolver.ts, settings.ts |
-| AI Backend | 実際のAI処理 | Claude Code, Codex CLI, Cursor CLI, Grok CLI, Local LLM (Ollama / vLLM) |
-| Workspace | ファイル・スキル | skills/, AGENTS.md, ローカル資料 |
+| レイヤー           | 役割                            | 実装                                                                                                         |
+| ------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Chat               | ユーザーインターフェース        | discord.js, @slack/bolt, http (Web Chat), @line/bot-sdk                                                      |
+| xangi              | AI CLI / Local LLM の統合・制御 | runner-manager.ts, dynamic-runner.ts, agent-runner.ts                                                        |
+| Backend Resolution | チャンネル別バックエンド解決    | backend-resolver.ts, settings.ts                                                                             |
+| AI Backend         | 実際のAI処理                    | Claude Code, Codex CLI, Cursor CLI, Grok CLI, Antigravity CLI, GitHub Copilot CLI, Local LLM (Ollama / vLLM) |
+| Workspace          | ファイル・スキル                | skills/, AGENTS.md, ローカル資料                                                                             |
 
 ## コンポーネント
 
@@ -50,24 +50,29 @@ flowchart LR
 起動シーケンス専用の薄いエントリーポイント。担当は以下のみで、各機能の実体は個別モジュールに分離されている:
 
 - 設定読み込みと検証（`config.ts` / `config-validate.ts`）
-- 有効化されたクライアントの起動分岐（Discord / Slack / Web Chat / LINE。Web オンリー構成では Discord Client を生成しない）
-- スケジューラー・各種 HTTP サーバー（tool-server / events-stream / event-trigger / approval-server 等）の起動
-- SIGTERM/SIGINT ハンドリング（`stream-finalizer.ts` の確定処理を含む graceful shutdown）
+- 有効化されたクライアントの起動分岐（Discord / Slack / Web Chat / LINE / Telegram。Web オンリー構成では Discord Client を生成しない）
+- Discord / Slack / LINE / Telegram は起動処理を並行開始する。Discord / Slack は `platform-startup-retry.ts` がDNS・timeout・reset等の一時障害だけを指数バックオフ（最大60秒）で同一process内再試行し、Telegram は Bot API・webhook登録・pollingの既存retryを使う。LINE / Telegram のwebhook待受は実際の `listening` まで、Telegram pollingは最初の`onStart`まで待機する。一方の待機中も他chatとWeb Chatは利用可能。認証失敗・待受port競合・恒久的なpolling停止は非0終了する
+- スケジューラー・各種 HTTP サーバー（tool-server / events-stream / event-trigger 等）の起動
+- SIGTERM/SIGINT ハンドリング。実行中表示の確定後、管理中のAgent CLIへSIGTERMを送り、実際の終了を待ってからextension・dataDir lockを解放する。期限内に終了しない子processはSIGKILLへ昇格する
+- Slack / Discord / Web / agent toolの再起動要求は自プロセスへのSIGTERMに統一し、上記のgraceful shutdownを必ず通す
 
 ### Discord 統合（src/discord/）
 
 `discord.js` v14 ベース。役割別にモジュール分割されている:
 
-- `message-handler.ts` — MessageCreate/Update/Delete のハンドリングと `processPrompt`（メンション / DM / `AUTO_REPLY_CHANNELS` 判定 → Runner 転送）
+- `message-handler.ts` — MessageCreate/Update/Delete のハンドリングと `processPrompt`（メンション / DM / `settings.json` の `discordAutoReplyChannels` 判定 → Runner 転送。Discord system message は処理対象外）
 - `slash-commands.ts` — スラッシュコマンド定義と Interaction 処理
-- `scheduler-bridge.ts` — スケジューラの Discord 送信関数・エージェント実行関数の登録
+- `scheduler-bridge.ts` — スケジューラの Discord 送信関数・エージェント実行関数の登録。schedule / trigger 起点の処理中メッセージも `ui.ts` の処理中メッセージ管理に登録し、Stop / 延長 / 残り時間表示を通常メッセージ経路と揃える
 - `ui.ts` — ボタン行（Stop / 延長 / 残り時間表示）・処理中メッセージ管理
 - `tool-history.ts` — ツール履歴の整形・蓄積（`TOOL_HISTORY_MAX_LINES` で表示行数を制限）
-- `message-utils.ts` — Discord メッセージリンク展開・返信元引用・チャンネルメンション展開
+- `message-utils.ts` — Discord メッセージリンク展開・返信元引用・スレッド元引用・チャンネルメンション展開
 
 挙動:
 
-- per-channel セッション分離（`contextKey = discord:<channelId>`）
+- per-channel / per-thread セッション分離（`contextKey = discord:<channelId>`。スレッド返信モードで新規スレッドを作成できた場合は `discord:<threadId>`）
+- Discord API 投稿先は親チャンネルまたは作成済みスレッド、runner / timeout / Stop / processing 管理は確定済みの `runKey = contextKey` で分離し、同じDiscordチャンネル内の別スレッドを別実行単位として扱う。スレッドのpromptには親チャンネル名/IDとスレッド名/IDを併記し、追加検索なしでどちらも送信先に選べるようにする
+- Discord スレッド内の per-channel 設定解決は原則として親チャンネルIDを使う。`CHANNEL_OVERRIDES`（`/backend` / `/llmmode`）、`settings.json`（`/notify` / `/threadmode`）、チャンネル topic 注入は親チャンネル設定を継承する。`/autoreply`だけはスレッドIDへ明示overrideを保存し、未設定時に親チャンネルの値を継承する
+- 既存スレッド内の発言では、Discord の starter message（親チャンネル側の元メッセージ）を `🧵 スレッド元` としてプロンプトに注入し、スレッド履歴だけでは見えない最初の話題にフォーカスする
 - スレッド・添付ファイル・リアクション対応
 - ストリーミング表示は `stream-session.ts`（Slack / Web と共通コア）で思考表示・更新スロットリングを統一し、ボタン UI を `message.edit` で 1 秒粒度に更新
 - プロセス終了時（SIGTERM）は `stream-finalizer.ts` が実行中のストリーミング表示を「⏸ プロセス再起動により中断されました」へ確定させる（message-handler / scheduler-bridge 両経路で登録）
@@ -76,18 +81,71 @@ flowchart LR
 
 `@slack/bolt` ベース。
 
-- `app_mention` / DM をハンドリング、スレッド単位で session 分離（`contextKey = slack:<channelId>:<threadTs>`）
+- `app_mention` / DM をハンドリング、スレッド単位で session 分離（`contextKey = <channelId>:<threadTs>`）
+- `message` event は通常メッセージ、人間の `/me` 投稿 (`me_message`)、添付付きの `file_share` を処理し、チャンネル名変更などその他の `subtype` 付き Slack システム通知は無視する
+- メンションで開始した active thread 内では、後続メッセージをメンション無しで処理する。対象外チャンネルの無関係なスレッド返信は拾わない
+- Slack API 投稿先は `channelId`、runner / timeout / Stop / processing 管理は `runKey = contextKey` で分離し、同じSlackチャンネル内の別スレッドを別実行単位として扱う
+- backend設定解決は親`channelId`、runner実行は`runKey`を使う。`/backend set/show/reset`は`CHANNEL_OVERRIDES`と起動中resolverを同時更新し、同チャンネル配下の既存スレッドsession / runnerを破棄するため、再起動なしで次のメッセージから切り替わる
+- 同一 `runKey` の実行中は二重起動を抑止し、Slack の `app_mention` と `message` の重複配送は message ts de-dupe と bot mention skip で一本化する
+- 実行中は `tool-history.ts` の整形済みツール履歴を表示し、完了後は途中コメントとツールを時系列で `History` ボタンから押した本人だけへ元スレッド内で表示する。ボタンにターン参照を保持するため、プロセス再起動後も永続ログから復元できる
 - スラッシュコマンドとリアクション対応
 - `chat.update` でメッセージ末尾に Stop / 延長 / 残り時間ボタン行を 1 秒粒度で差し替え
+- `completion-summary.ts`が全platformの完了表示を共通化する
+- スレッド返信しないターンでは、一定時間以上かかった完了時に上記の別メッセージを投稿して視認性を補う
 
 ### Web Chat（web-chat.ts）
 
+- message permalinkは`/chat/<appSessionId>#message-<messageId>`。Web / Discord / Slack由来の各transcript entryに共通で付与する。React側はURLから対象sessionを復元し、必要なら履歴を前方pageして該当messageへ移動・強調する。Discord / Slack入力に同一instanceのpermalinkが含まれる場合、`session-reference.ts`がsessionとmessageの存在を検証し、その1 messageだけを命令ではないuntrustedな引用blockとしてpromptへ追加する。各IDは参照キーであり認証情報ではない
+
 `http.createServer` ベースの軽量サーバー（Express 依存なし）。
 
-- ペイン単位でセッション分離（`contextKey = web:<paneId>`）、`WEB_CHAT_PORT` で公開
-- SSE で streaming response + timeout イベント (`timeout-started/extended/cleared`) をフロントへ push
-- フロントエンドの tick で残り時間表示を毎秒更新（追加 API 呼び出しなし）
-- ファイル添付・ダウンロードは `WEB_CHAT_UPLOAD_ACCEPT` / `WEB_CHAT_DOWNLOAD_ACCEPT` で許可拡張子を制御
+- React + TypeScript + Vite の単一画面を `web/app` へbuildし、`WEB_CHAT_PORT` で配信する
+- Discordセッションは、履歴を引き継ぐWeb分岐と、Bot投稿を表示したうえで同じDiscord `contextKey` / appSessionIdを直接処理するリモート入力の2経路を持つ。後者はBot自身の`MessageCreate`を経由せず、無限ループを避ける
+- 新規会話、最新100セッションの検索・選択、直近50メッセージ、SSE応答ストリーミングだけを主要操作にする
+- 添付アップロードは`XMLHttpRequest.upload`のprogress eventを使い、PC・スマートフォンともファイル名、複数選択時の順番、転送率を入力欄の直上へ表示する
+- workspace・upload済みファイルの配信は`Range` requestへ`206 Content-Range`で応答し、iPhone Safariを含むmedia elementのmetadata取得・seek・再生を可能にする。範囲外は`416`を返す
+- session詳細の一時的な読込失敗は安全なGET retry後に表示するが、後続の正常読込でその読込エラーだけを消す。より新しい送信・upload等の操作エラーは消さない
+- Web ProjectはDiscordのチャンネル相当の論理namespaceとして扱う。`DATA_DIR/web-projects.json`に名前・追加prompt・任意のbackend/model/effortを保存し、sessionの`projectId`で関連付ける。既存Web sessionの`projectId`は実行中でなければ変更・解除できる。Project作成時にdirectory・Git repository・instruction fileは作成しない。不正なProject項目はその項目だけを読み飛ばし、利用できないbackend/model/effortはそのProjectで無効化して、他の機能を起動し続ける
+- Web Project画面は既存の絶対pathを中央registryへ追加し、未使用Workspaceの登録解除も行う。登録解除はdirectoryやfileを変更せず、default、Project・既存sessionからの参照、platform channel bindingがある場合は拒否する
+- `xangi service restart`と`xangi tool system_restart`は、再起動要求の前に新しいCLIが本番のWeb Project stateをread-only検証する。互換性のない状態を見つけた場合は再起動を中止し、stateファイルは変更しない
+- Web backendの解決優先順位はsession固有override（`/backend set`）→ Project既定値 → runtime既定値。`/backend reset`はsession overrideだけを消す。Project移動でprovider backendが変わる場合は、provider session IDを再利用せず保存済みtranscriptを次turnへ先読みして文脈を保つ
+- `GET /api/sessions` は既定で最新100件と`activity`、provider文脈を継続できるかを示す`sessionMode`を返し、`lifecycle=open|closed`と`updatedSince`でSession状態・更新日時をserver側絞り込みできる。`GET /api/sessions/:id`も`isActive`と`activity`を返し、Web送信SSEが切れても同じturnのserver状態または保存済みtranscriptへ復帰する。POSTは自動再送しない。タイトル導出ではログ全体を読まず先頭のJSONL 1行だけをchunk読込する
+- Project絞り込みは`GET /api/sessions`と`GET /api/sessions/stream`のserver側で行う。検索入力中にSSEを再接続せず、初期検索の重複requestも抑える
+- `/monitor` は同じReactアプリのSession監視モード。画面ではSessionを実行中・入力待ち・完了の3列に分類し、内部のOpen / Closedは表示しない。provider側の文脈を持たないstateless extension backendは実行中だけ表示し、応答完了後は入力待ち・完了の両方から除外する。会話ログ自体はChatに残す。完了は既定で直近24時間を表示する。エラーと中断は独立列を作らず、入力待ちカードの状態ラベルと色付きドットで示す。詳細から会話を開くほか、履歴を残したまま`POST /api/sessions/:id/close`でSessionを完了にできる。完了後の履歴画面でも、元のDiscordへの継続と履歴を引き継ぐWeb分岐の既存導線を維持する。`GET /api/sessions/stream`でターン境界のsnapshotを受け取り、定期ポーリングしない
+- `/workspace` は同じReactアプリのworkspace browser/editorモード。`workspace-browser.ts`が`WORKSPACE_PATH`配下だけを列挙・読込し、workspace相対pathに加えて同じroot内の絶対pathを正規化する。hidden/state/依存物/build成果物・symlink・非テキスト・1 MiB超は拒否する。Web Chatのテキストファイルリンクは`/workspace?path=...&line=...`へ変換し、親directoryと対象fileを開いて指定行を選択する。コードフェンス・inline code・indent code内の`MEDIA:`は分割対象外とし、実メディア記法だけをMarkdownの外へ分離する。MarkdownのYAML frontmatterから`tags`を抽出し、UI側でタグ絞り込みと名前・更新日時の並び替えを行う。保存は読込時SHA-256との一致を確認し、同一directoryの一時fileからatomic renameする。外部変更時は409を返し、UIが再読込を促す
+- `/schedules` は予定管理モード。Web / Discord / Slack / Telegram予定の追加・編集・有効状態変更・削除をHTTP API経由で行う。Web予定の`channelId`は新規会話を示す予約値へ統一し、任意の`projectId`を保存する。実行時にProjectの存在を再検証して新しいWeb sessionを作成し、そのsessionへ通常のWeb agent runner経路でturnを追加する
+- Chat / Files / Schedules / Monitor / Extensionsは共通navigation shellを使う。desktopでは左のactivity rail、768px以下またはtouch端末の低い横画面では下部navigationへ切り替え、Monitor・Extensions・theme selectorを`その他`sheetへ収める。system / light / darkの選択をlocalStorageへ保存して`data-theme`でsemantic color tokenを切り替える。Monitorの表示分類は`isActive`なら実行中、Openかつ非実行なら入力待ち、Closedなら完了とする。内部では`lifecycle`をOpen / Closed、`isCurrent`を次回投稿のrouting pointerとして別々に維持する。`lifecycle`がない既存Sessionはrouting pointerの有無にかかわらずClosedとし、実際に次の入力を受けた時点でOpenへ移行する
+- Reactはbuild時に静的assetへbundleするため、配布先にNode.js以外のフロントエンド実行依存を追加しない
+
+### macOS・Linux・WSL2セットアップ・更新コア
+
+- `installer/layout.ts` はapp versionsとworkspace/state/configを分離する。将来のWindows adapterも同じlogical layoutを使う
+- `installer/manifest.ts` と `updater.ts` はEd25519、SHA-256、update lock、staging、atomic current切替を担当する。初回installのservice起動時はhealth確認と失敗時rollbackを行う
+- `installer/platform/darwin.ts` はLaunchAgentだけを担当し、OS固有処理を共通updaterから分離する
+- `installer/platform/linux.ts` はXDG配置と`systemd --user` lifecycleを担当する。`WorkingDirectory=`は値全体を引用せず、空白などをsystemdのpath構文でescapeする。WSL2はsystemd有効環境に限定し、設定URLは`wslview`、なければ`cmd.exe`でWindows側ブラウザへ渡す
+- `setup/guided-onboarding.ts` は対応agent CLIをPATH、`NVM_BIN`、`~/.nvm/versions/node/*/bin`と`--version`で決定論的に検出する。検出した実行ファイルの絶対pathはservice PATHとrunnerで共通利用する。agent UIへは短い開始promptだけを渡し、詳細手順はmode 0600の一時ファイルに分離して終了時に削除する。初回フローはWeb Chatをlocalに固定し、service起動と`doctor`の成功までTailscaleに触れない。localの基本セットアップ完了後だけ、利用者にTailscale / LANの追加設定を案内する。`setup --access`は完了済みのオンボーディング状態を戻さず公開範囲だけを更新する。localとtailscaleはruntimeをloopbackに保ち、tailscaleだけは同一portのTailscale Serve TCP転送を明示選択後に設定する。lanは`0.0.0.0`へbindする前に認証なしの警告を出す。config保存・workspace mode検証・repository template適用・BOOTSTRAP完了判定はxangiの`setup --apply` / `setup --complete`が担当する
+- `onboarding.json` は`preflight` / `bootstrap_in_progress` / `minimum_ready`をconfig領域へatomic保存し、中断後の再開と診断の正本になる。AIオンボーディングを置き換えるsetup用browser UIは持たず、対応agentが無い場合はinstall手順を表示して終了する
+- `secrets.json` はOS別config領域へmode 0600でatomic保存する。`xangi settings`はDiscord許可ユーザーIDとtoken用の一時GUIをloopbackだけに開き、one-time URL、Host検証、no-store/CSPを適用する。保存済み値はbrowserへ返さず、保存後にserverを閉じ、AI・workspace・setup JSON・shell historyから接続設定を分離する
+- `packaging/bootstrap.sh` は全対応OS共通の`install.sh`としてGitHub Releaseへ配置する。Darwin / Linuxとarm64 / x64を自動判定し、同じReleaseのtarget installerへ振り分ける。WSL2はLinuxとして扱う。pipe経由の実行では常にsetupとservice起動を延期し、署名検証済みCLIの配置後に通常のTerminalから`xangi setup`を実行するよう案内する。shell/readlineとAI TUIの端末所有権をpipe内で引き継がない
+- `packaging/build-bundle.sh` はcompiled runtime・production依存・documentationに加え、Web Chatの公式HTML 3ファイルだけを明示allowlistで同梱する。`web/node_modules`やsecret候補は含めない。`packaging/build-installer.mjs` はrelease build時に署名済みmanifestとbundleを照合し、manifest・artifactのSHA-256とEd25519公開鍵をtarget installerへ埋め込む。target installerはNode runtime、CLI entrypoint、Web UI資産を検証してから、検証済みbundle、atomicな`current` symlink、stable launcher、`~/.local/bin/xangi`をAI onboarding前に確定する。外部AIやserviceの失敗は配布物をrollbackせず、利用者が`xangi setup`または`xangi install`で再開できる状態を保つ
+- `.github/workflows/release-assets.yml` はDarwin / Linux × arm64 / x64をnative runnerでbuildし、最終jobだけがEd25519秘密鍵を使ってmanifestへ署名する。version固定artifact URLと`releases/latest`の更新確認用manifest URLをinstallerへ埋め込み、bundle・manifest・installer・checksumを同じGitHub Releaseへ添付する
+- `workspace-template.ts` は利用者が選択した時点で指定GitHub repositoryのbranch最新commitを解決し、commit固定archiveをGitなしで取得する。repository・commit SHA・archive SHA-256をstateへ記録し、空workspaceへatomic展開する。通常のinstall/updateでは初回だけ適用するが、利用者がsetupでtemplate modeを明示的に選び直した場合は、適用済みstateが残っていても対象が空または未作成なら安全に再展開する。既存ファイルがあるworkspaceは変更しない
+- `platform/*-update.ts` は6時間ごとに署名済みchannelを確認するLaunchAgent / systemd user timerを管理する
+- `xangi uninstall`はupdate schedulerとserviceの既存adapterを使って停止・登録解除した後、app rootだけを削除する。config/state/workspaceはappと分離されているため既定では保持し、`--purge --yes`の明示時だけconfig/stateを追加削除する。workspaceは常に対象外とする
+- managed serviceは実行専用の`installer/runtime-config-main.ts`を入口にしてsetup configを環境変数へ変換してからruntimeをimportする。`current`シンボリックリンクと実体pathの違いでmain判定が外れないよう、libraryの`runtime-config.ts`には直接実行判定を持たせない
+- `setup`の共通configはmanaged serviceとcheckout PM2の両方が読む。checkout PM2へは秘密値を含まないconfig pathとstate pathだけをecosystem経由で渡す
+- checkoutの`update`はclean worktree、branch、upstreamを検証して`git pull --ff-only`、依存更新、buildを行う。`--managed`指定時は署名済みmanaged updaterを使う
+- `doctor`はcheckoutではPM2を検出し、Web Chatの`/api/sessions`が返すworkdirをsetup configとrealpath比較する。tailscale accessでは、有効なWeb Chat portのTailscale Serve TCP転送がloopbackを向いていることも確認する
+- `extensions.ts`は明示的にlinkされた`xangi-extension.json`だけを`${DATA_DIR}/extensions.json`のmode 0600 registryへ保存し、同じOS userで動く別DATA_DIRのinstanceとは共有しない。旧OS user共通registryは起動時に、現在の`${DATA_DIR}/extensions/sources/`配下にmanifestがあるentryだけを新registryへ移行し、他instanceのentryはコピーしない。schema v2 manifestは相対entrypoint、`managed-http` runtime、HTTP capability、任意のUI pathを宣言し、固定URLやportは保持しない。xangiはentrypointの`serve --workspace <path>`を子processとして起動し、OS自動割当の`127.0.0.1` URLをreadiness JSONから取得する。親が生成したBearer tokenを子と内部proxyだけで共有し、browserやmanifestへ公開しない。readiness JSONのschema・ID・workspace・loopback URLの検証成功をruntime登録の境界とし、その後の初回health timeout、非2xx、`ready: false`はcold start中に回復できる状態として子processを停止・登録解除しない。状態は`running`（process生存）、`healthy`（healthが2xx）、`ready`（2xx payloadが`ready: false`でない）を分け、旧extensionの`ready`省略はreadyとして扱う。stdin切断とgraceful shutdownで子を停止する
+- Web UIの`/extensions`は、空env・空stateの初回起動でも公式curated catalogのxangi-searchを表示する。表示用catalogは公式項目を先に確保し、設定済みmanifest、repository source、linked registry、status確認を独立した入力として扱う。対応外schema、不正JSON、欠落fileなどが1件あっても正常な項目と公式項目をHTTP 200で返し、`degraded`と`issues`で部分失敗を通知する。旧schemaの変換、stateの自動修復、networkからの再取得は一覧表示では行わない。linked extensionがある場合はlinked manifestを表示内容の正本にし、repository sourceとcanonical manifest pathが一致する場合だけsource情報と更新操作を関連付ける。状態を判定できない項目は「未インストール」と断定せず、UIで状態不明として操作を無効化する。登録・setup・更新などstateを変更する経路は引き続きstrictな検証を行う。公式候補の表示だけではnetwork取得やcode実行を行わず、「追加」を選んだ時に公開GitHub repositoryの検証・取得と専用setup会話を開始する。CLIや配備作業で先にlinkされたextensionも、installed状態とは独立した「セットアップ」操作から同じ専用会話を開始できる。`XANGI_EXTENSION_DEV_MANIFESTS`に事前設定したlocal manifestと、利用者が追加した公開GitHub repositoryも同じcatalogへ統合する。GitHub URLは`https://github.com/owner/repository`のrootだけを受理し、認証情報を使わずpublic repositoryであることを確認する。default branchのcommit SHAへ固定したtarballを50 MB上限で取得し、単一rootかつ通常file/directoryだけであることを検証してから`${DATA_DIR}/extensions/sources/`へatomic展開する。repository rootの`xangi-extension.json`を検証し、repository URL・commit SHA・archive SHA-256・追加時刻・取得できたlicenseを`${DATA_DIR}/extension-sources.json`へmode 0600で保存する。この時点ではextension codeを実行しない。追加時は専用Webセッションを作り、manifestの`setup.instructions`、`XANGI_SETUP.md`、`README.md`の順でrepository内のsetup文書を選んでLLMへ渡す。setup文書は上位指示を上書きしない参考資料として扱い、agentへは現在のxangi instance固有のextension registry pathを安全な環境変数として渡す。低levelのinstall APIはregistryへのlinkと親process内runtime managerによるstart、removeはstopとunlinkを行い、codeやextension dataはdeleteしない。UIを宣言したextensionはカードの「開く」から同一origin proxyへ遷移し、xangiは実行中runtimeのURLへ認証付きで中継する。browserから任意path、upstream、Bearer tokenを指定できず、変更requestはWeb UIと同じhostだけを受け付ける
+- Extensions画面の通常削除は即時unlinkせず、linked manifestのsetup文書とREADMEを渡した専用LLM会話を開始する。LLMはworkspace内のextension固有hook、skill、`AGENTS.md`ルール、schedule、その他の設定を特定し、具体的な差分と保持項目を提示して承認後だけ最小cleanupを行う。その後、任意のPATH上のCLIではなく現在のxangi親processが所有する`extension_uninstall`固定toolを呼ぶ。toolは同じinstanceでstop、unlink、registry未登録とruntime停止を検証し、`complete`、`linked`、hook反映時点、再起動要否を返す。sourceとextension dataは既定で保持し、完全消去は別承認へ分離する。低levelの`DELETE /api/extensions/:id`は自動化・互換用としてstopとunlinkだけを行う
+- repository管理extensionの更新は、Extensions UIから専用の`Update: <displayName>` Webセッションを作る。対象はlinked済みの公開GitHub sourceで、manifestが`update.prepare.command`と`args`を宣言したextensionとし、特定ID・repository・package managerには依存しない。会話開始時にdefault branchのtarget commit SHAを固定し、LLMは説明・承認・結果報告を担当するが、任意のshell/git手順では更新しない。実変更はxangi親process内の`extension_update`がsource lockを取り、target/current SHAの再検証、候補manifest検証、停止、atomic source swap、最終配置pathでの更新準備、registry再link、start、doctorを行う。更新準備はshellを介さず、manifestのprogramと引数を分離して`execFile`で実行する。permission/capabilityの追加、entrypoint/agent backend/UI mapping/update preparationの変更は明示承認なしではswap前に停止する。swap後の失敗は旧directoryとregistryを復元し、更新前にrunningだった場合だけ旧版をstartしてdoctorする。更新成功後にのみsource stateのcommit SHAと`updatedAt`をatomic保存する。更新が成功した後、同じLLMはmanifestのsetup文書を更新後の内容で読み直し、repository内の同梱スキルとworkspace側の同名スキル、関連する`AGENTS.md`ルールを比較する。API・操作手順・常時適用ルールに実質差分がある時だけ、理由・対象path・変更概要を提示し、workspace変更は別の明示承認を得てから最小差分で行う。表記・整形だけの差分、workspaceの自動更新、repository sourceを持たないlocal manifest、background自動更新は対象外とする
+- extensionのsetup requestはrepository root内のREADMEをsetup文書とは別に解決する。setup文書に承認待ちの設定・workspace変更・任意機能がある場合、LLMはgenericな活用案や次回依頼へ置き換えず、重要な差分・影響・選択肢を具体的に提示する。返答待ちの項目は変更せず、未決の間はsetup完了と報告せずに同じsetup会話で継続する。setup、status、doctorが成功した後、LLMはそのREADMEとworkspace内のREADME・AGENTS.md・上位directory構成に限定して利用者の目的と既存workflowを把握し、適合理由・最初の依頼または操作・期待結果を含む活用案を2〜3件提示する。推薦段階はread-onlyとし、workspace・設定の変更、自動化、外部送信、定期実行は別の明示確認へ分離する。
+- `autostart`が有効なextensionはxangi processの起動時に開始する。起動logはready済みと、processは開始したがwarming中の状態を区別する。全体の`doctor`は各extensionの`doctor`も集約し、`ready: false`をerrorとして報告するが、1 extensionの起動失敗やwarmingで他のchat platformまで停止させず、該当capabilityの利用時に明示エラーを返す
+- 機能固有adapterは共通lifecycleから分離する。`workspace.search` adapterはcapabilityのruntime URLを親processのmemoryから解決し、HTTP requestへ親だけが持つ認証headerを追加する。複数のxangi instanceはそれぞれ別の子process・自動割当port・workspaceを所有する。個別extensionの実装・運用仕様は各repositoryの文書を正本とする
+- `src/cli/xangi-main.ts`はCLI実行専用entrypointで、`src/cli/xangi.ts`がexportする`run()`を無条件に呼び、top-level errorを終了コードへ変換する。CLI library自身は`import.meta.url`と`process.argv[1]`を比較して実行可否を判定しない。これによりmanaged版の`~/.local/bin/xangi → app/bin/xangi → current → dist/cli/xangi-main.js`という複数symlink経路でも起動責務が曖昧にならない
+- checkoutの`bin/xangi`はlocal `tsx`で現在の`src/cli/xangi-main.ts`を実行し、Git管理外の古い`dist/`を使用しない。sourceを含まない配布bundleでは同梱`dist/cli/xangi-main.js`とNode runtimeを実行し、オンボーディングの正本になるREADMEと利用者向けdocsもallowlistで同梱する
+- `notionSyncEnabled` はデフォルトOFFのglobal gate。OFF中のstatus/disableはNotion APIへ接続せず、通常runもadapter生成前に拒否する。`run --once`だけが明示的な一回実行としてgateを越え、同期stateとbackupはdisable後も保持する
 
 ### LINE Bot 統合（line.ts）
 
@@ -126,6 +184,23 @@ LINE には Slack の「スレッド」や Discord の「New ボタン」のよ�
 
 公開エンドポイントは Tailscale Funnel / Cloudflare Tunnel 等で別立て。詳細は [`docs/line-setup.md`](line-setup.md)。
 
+### Telegram Bot 統合（telegram.ts）
+
+Telegram Bot API 経由の対話に対応。設計方針:
+
+- `grammy` ライブラリを使用。webhook と long polling の両方の起動モードに対応（初期実装は long polling がデフォルト）。
+- テキスト、写真、動画、許可MIME文書を監視し、DMおよび許可されたグループチャットのみを処理対象とする。媒体受信は明示的なopt-inで有効化する。
+- 許可ユーザーID（`TELEGRAM_ALLOWED_USER`）および許可Bot ID（`TELEGRAM_ALLOWED_BOTS`）の allowlist 検証を行う。
+- グループチャットでは、Botへのメンション、返信、または `TELEGRAM_AUTO_REPLY_CHATS` でのメッセージ検知で応答を開始。
+- メンション `@xangi_bot` を自動除去したテキストを Runner へ引き渡す。
+- 許可Botからの連続応答回数を制限する無限ループ防止策（`TELEGRAM_ALLOWED_BOTS_MAX_CONSECUTIVE`）を導入。
+- `StreamSession` に基づき、処理中メッセージを 1 秒間隔で `editMessageText` 更新するストリーミング表示に対応。
+- 受信媒体は認可後に保存し、サイズ・MIME・既知形式のシグネチャを検証する。同一アルバムを1回のAgent実行へ集約し、保存ファイルはretention設定に従って削除する。
+- 媒体ダウンロードからAgent実行までをチャット単位キューで直列化し、generationで`/new`と`/stop`後の旧処理を無効化する。無効化された処理の取得済みファイルは破棄する。
+- Agentの構造化添付は画像・MP4・その他の文書へ分類してTelegramへ送信し、成否不明の添付は二重送信防止のため自動再送しない。
+- 最終回答が Telegram の文字数制限（4096文字）を超える場合は、`splitMessage` を用いて分割送信。
+- セッションリセットコマンド（`/reset`, `/new`, `/clear`）、実行中・待機中・媒体取得中のタスク停止（`/stop`）、ヘルプ表示（`/help`）に対応。
+
 ### エージェントランナー（agent-runner.ts）
 
 AI CLIを抽象化するインターフェース：
@@ -144,9 +219,24 @@ interface AgentRunner {
 }
 ```
 
-すべての Runner 実装 (Claude Code / Codex / Cursor / Grok / Local LLM / Dynamic) は EventEmitter
+拡張はmanifestの `agentBackend` で同じインターフェースへ参加できる。xangiの `ExtensionAgentRunner` は共通HTTP契約とtranscript保存だけを担当し、検索・整形・モデル利用などの実装詳細は拡張側に置く。導入フローは[拡張機能連携](usage.md#拡張機能連携)を参照。
+
+セッション型の Runner 実装 (Claude Code / Codex / Cursor / Grok / Antigravity / GitHub Copilot / Local LLM / Dynamic) は EventEmitter
 でもあり、`timeout-started` / `timeout-extended` / `timeout-cleared` を emit して
-上位 (web-chat の SSE / Discord bot / Slack bot) が UI 更新に利用する。
+上位 (web-chat の SSE / Discord bot / Slack bot) が UI 更新に利用する。単発HTTP adapterはこのtimeout eventを持たない。
+
+### Activity Store（activity-store.ts）
+
+`runWithBubbleEvents` の共通ライフサイクルから、現在ターンの軽量スナップショットを更新する。
+
+- `turn.started` 相当で `thinking`
+- `onText` で `streaming`
+- `onToolUse` で `tool` と直近ツール行
+- `onComplete` / cancel / error で `complete` / `aborted` / `error`
+- 呼び出し元が `eventTextSanitizer` を指定した場合、activity と共通 events には整形後の本文を流し、Runner の生応答は transcript 用に保持する
+- 現在状態のスナップショットはプロセスメモリのみ。途中コメントとツールは境界ごとに `logs/monitor-activity/*.jsonl` へ時系列保存し、最終stream segmentは通常のassistant本文と重複するためHistoryへ保存しない
+- `sessions.json` と会話transcriptの形式は変更せず、Web Chatは`GET /api/sessions/:id/turn-history`からHistoryだけを遅延取得する
+- `GET /api/sessions` と Even Terminal 互換 `GET /api/sessions?provider=...` が同じ activity を参照する
 
 ### タイムアウトコントローラー（timeout-controller.ts）
 
@@ -154,11 +244,11 @@ interface AgentRunner {
 
 ```typescript
 class TimeoutController extends EventEmitter {
-  start(channelId, onTimeout): void;       // リクエスト開始 + emit 'timeout-started'
-  clear(channelId, reason): void;          // 完了 / エラー + emit 'timeout-cleared'
+  start(channelId, onTimeout): void; // リクエスト開始 + emit 'timeout-started'
+  clear(channelId, reason): void; // 完了 / エラー + emit 'timeout-cleared'
   extend(channelId, additionalMs): ExtendTimeoutResult; // 延長 + emit 'timeout-extended'
-  getState(channelId): TimeoutState;       // UI 表示用
-  clearAll(reason): void;                  // shutdown 時に全 cleanup
+  getState(channelId): TimeoutState; // UI 表示用
+  clearAll(reason): void; // shutdown 時に全 cleanup
 }
 ```
 
@@ -179,20 +269,21 @@ class TimeoutController extends EventEmitter {
 ```
 
 BackendResolverの優先順位:
-1. `/backend set` で設定されたchannelOverrides（メモリ上、`.env`のCHANNEL_OVERRIDESに永続化）
+
+1. `/backend set` で設定されたchannelOverrides（メモリ上、`.env`のCHANNEL_OVERRIDESに永続化。Discord スレッドでは親チャンネルIDで解決）
 2. `.env` のデフォルト（`AGENT_BACKEND`, `AGENT_MODEL`）
+
+`backend-effort.ts`がbackendごとの対応effortを一元管理する。`/backend set`と`CHANNEL_OVERRIDES`読み込み時に組み合わせを検証し、非対応値は保存・適用しない。解決済みeffortは各runnerが実CLI引数へ変換する。
 
 ### システムプロンプト（base-runner.ts）
 
 xangiがAI CLIに注入するシステムプロンプトを管理：
 
 - **チャットプラットフォーム情報** — Discord/Slack経由の会話であることを伝える短い固定テキスト
-- **XANGI_COMMANDS** — `src/prompts/` からプラットフォームに応じたコマンド仕様を注入
-  - 共通コマンド（`xangi-commands-common.ts`）: タイムアウト対策等
-  - チャットPF共通（`xangi-commands-chat-platform.ts`）: ファイル送信（MEDIA:）・セパレータ（===）・スケジュール・システムコマンド
-  - Discord専用（`xangi-commands-discord.ts`）: `xangi-cmd discord_*` CLIツール・自動展開
-  - Slack専用（`xangi-commands-slack.ts`）: Slack固有の操作
-  - プラットフォーム自動判別: Discordのみ有効なら Discord専用コマンドだけ注入（トークン節約）
+- **XANGI_COMMANDS** — 常駐promptには長時間処理・自己再起動・`MEDIA:`・platform固有IDなど、実行時に必要な契約だけを注入
+  - コマンドのusageは `xangi tool help <topic|command>` のmetadataを正本とし、必要な時だけ取得
+  - ユーザー向けslash commandは各platformの `/help` とcommand metadataを正本にする
+  - platform未指定時は固有ルールを注入せず、Discord / Slackの操作説明を混在させない
 - **プラットフォーム識別** — 各メッセージに `[プラットフォーム: Discord]` or `[プラットフォーム: Slack]` を注入。AIが適切なコマンドを使い分け
 
 #### Runtime context 注入（runtime-context.ts）
@@ -204,35 +295,43 @@ xangiがAI CLIに注入するシステムプロンプトを管理：
 ```
 
 - **目的**: Bash tool の cwd 持続はメッセージ受信を跨いで保証されないため、AI が借りリポと本体リポを取り違えて `git push` する事故を構造的に減らす
-- **取得**: `process.cwd()`（同期）+ `git rev-parse --show-toplevel` / `git branch --show-current`（5 秒キャッシュ）
+- **取得**: 各runnerが実際に使う`workdir`（未指定時は子プロセスと同じ`process.cwd()`）+ `git rev-parse --show-toplevel` / `git branch --show-current`（5 秒キャッシュ）。通常はconfigが`WORKSPACE_PATH`をrunnerのworkdirへ設定する。xangi本体のcloneとagent workspaceが別でも、またrunnerごとにworkdirが異なっても、AIが実際に操作するcwdを表示する
 - **注入タイミング**: 全 backend の `run()` / `runStream()` 入口で `prependRuntimeContext()`。常駐プロセス（`persistent-runner.ts`）は `--append-system-prompt` が起動時固定なので user message 本文に注入する
 - **無効化**: `XANGI_RUNTIME_CONTEXT_ENABLED=false`（既定 true）で注入をオフにできる。雑談中心のインスタンスや、cwd ブレが事故に繋がらない用途で
-- **ツール呼び出し表示**: Discord のツール履歴表示は `DISCORD_TOOL_HISTORY_MODE=button|inline|off` で制御する。既定は `button` で、完了後の通常メッセージには履歴を混ぜず、`Tools` ボタン押下時に押した本人だけへ ephemeral で表示する。`DISCORD_SHOW_TOOL_BUTTON=false` なら `button` モードでも `Tools` ボタンを出さない。`inline` は従来どおり本文上部に表示、`off` は完全非表示。互換設定として `DISCORD_SHOW_TOOL_USE=false` は `off`、`true` は `inline` として扱う。実行中は `DISCORD_SHOW_LIVE_TOOL_USE=false` で無効化しない限り、実コマンドが分かる raw 表示を出す。完了後は `workspace-RAG検索` などの短い履歴ラベルへ正規化し、Bash/exec は `/bin/bash -lc` などの wrapper を落として短縮表示する。実行中の Bash/exec ツール呼び出しの引数表示の最大長は 200 文字で、env `XANGI_TOOL_DISPLAY_MAX` で変更可。
+- **ターン履歴表示**: 全バックエンドの共通イベント層で途中コメントとツール実行を時系列に永続化する。Discord の完了後表示は互換名の `DISCORD_TOOL_HISTORY_MODE=button|inline|off` で制御し、既定の `button` では通常本文へ混ぜず、`History` ボタンを押した本人だけへ ephemeral で表示する。ボタン操作はDiscordのinteraction期限に間に合うよう先にdeferし、プロセス再起動後はボタン内のターン参照から永続ログを復元する。DiscordとSlackは共通formatterで途中コメント内の連続改行を畳み、1イベント1行の同じコンパクト形式を使う。Slack も同じ `History` ボタン方式で、本人限定の一時表示にある`閉じる`ボタンはその表示だけを削除する。Web Chat は各回答の `History` 折りたたみを使い、再読み込み後も `/api/sessions/:id/turn-history` から復元する。従来の `/tool-history` API と env 名は互換性のため維持する。`DISCORD_SHOW_TOOL_BUTTON=false` なら Discord のボタンを出さない。`inline` は従来どおりツール行だけ本文上部に表示し、`off` は完了後履歴を非表示にする。互換設定として `DISCORD_SHOW_TOOL_USE=false` は `off`、`true` は `inline` として扱う。実行中は `DISCORD_SHOW_LIVE_TOOL_USE=false` で無効化しない限り、実コマンドが分かる raw 表示を出す。完了後は `workspace-RAG検索` などの短い履歴ラベルへ正規化し、Bash/exec は `/bin/bash -lc` などの wrapper を落として短縮表示する。実行中の Bash/exec ツール呼び出しの引数表示の最大長は 200 文字で、env `XANGI_TOOL_DISPLAY_MAX` で変更可。
+- **返信候補**: Discord / Slack / Web Chat の通常会話では、同じAI応答の末尾に専用JSONブロックで返信候補を生成させ、表示前にブロックを除去する。Discord / Slackは通常メッセージに `返信候補` ボタンだけを置き、押した本人への ephemeral 応答で候補を表示する。Web Chatは回答下の折りたたみUIで表示する。選択文は同じセッションへユーザー入力として渡す。Discordの `/replysuggestions` は `settings.json` の全体overrideを更新し、各プラットフォームはメッセージ処理直前に参照する。OFF時は候補生成指示をプロンプトへ追加しない。タイトル・transcript表示では履歴先読みや候補生成の内部メタデータも除去する。
 
 AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI CLIの自動読み込み機能に委譲：
 
-| CLI | 自動読み込みファイル | 注入方法 |
-|-----|---------------------|----------|
-| Claude Code | `CLAUDE.md` | `--append-system-prompt`（一回限り） |
-| Codex CLI | `AGENTS.md` | `<system-context>` タグで埋め込み |
-| Cursor CLI | `AGENTS.md` | CLI側で自動読み込み（xangi側の注入なし） |
-| Local LLM | `AGENTS.md`, `MEMORY.md` | システムプロンプトに直接埋め込み（`CLAUDE.md` は通常 `AGENTS.md` のシンボリックリンクのため除外） |
+| CLI         | 自動読み込みファイル     | 注入方法                                                                                          |
+| ----------- | ------------------------ | ------------------------------------------------------------------------------------------------- |
+| Claude Code | `CLAUDE.md`              | `--append-system-prompt`（一回限り）                                                              |
+| Codex CLI   | `AGENTS.md`              | `<system-context>` タグで埋め込み                                                                 |
+| OpenCode    | `AGENTS.md`              | CLI側で自動読み込み。`.agents/skills`もOpenCodeへ委譲                                             |
+| Cursor CLI  | `AGENTS.md`              | CLI側で自動読み込み（xangi側の注入なし）                                                          |
+| Local LLM   | `AGENTS.md`, `MEMORY.md` | システムプロンプトに直接埋め込み（`CLAUDE.md` は通常 `AGENTS.md` のシンボリックリンクのため除外） |
 
 ### AI CLIアダプター
 
-| ファイル | 対応CLI | 特徴 |
-|----------|---------|------|
-| claude-code.ts | Claude Code | ストリーミング対応、セッション管理 |
-| persistent-runner.ts | Claude Code（常駐） | `--input-format=stream-json` で常駐プロセス化、キュー管理、サーキットブレーカー |
-| codex-cli.ts | Codex CLI | OpenAI製、0.98.0対応、cancel対応 |
-| cursor-cli.ts | Cursor CLI | `cursor-agent` コマンド、JSON/stream-json、tool call表示対応 |
-| grok-cli.ts | Grok CLI | xAI `grok` コマンド、json/streaming-json、tool call表示対応 |
-| antigravity-cli.ts | Antigravity CLI | Google `agy` コマンド、headless `-p` 対応、最終応答フォールバック |
-| local-llm/runner.ts | Local LLM | Ollama等のローカルLLMを直接呼び出し、ツール実行・ストリーミング対応 |
+| ファイル              | 対応CLI             | 特徴                                                                                            |
+| --------------------- | ------------------- | ----------------------------------------------------------------------------------------------- |
+| claude-code.ts        | Claude Code         | ストリーミング対応、セッション管理                                                              |
+| persistent-runner.ts  | Claude Code（常駐） | `--input-format=stream-json` で常駐プロセス化、キュー管理、サーキットブレーカー                 |
+| codex-cli.ts          | Codex CLI           | OpenAI製、0.98.0対応、cancel対応                                                                |
+| opencode-cli.ts       | OpenCode            | JSON event streaming、session再開、`--auto`権限制御、variant対応                                |
+| cursor-cli.ts         | Cursor CLI          | `cursor-agent` コマンド、JSON/stream-json、tool call表示対応                                    |
+| grok-cli.ts           | Grok CLI            | xAI `grok` コマンド、json/streaming-json、tool call表示対応                                     |
+| antigravity-cli.ts    | Antigravity CLI     | Google `agy` コマンド、Agy 1.1.8以降のJSON/stream-json、slash展開の能力判定、旧版フォールバック |
+| github-copilot-cli.ts | GitHub Copilot CLI  | JSONL streaming、session再開、SKIP_PERMISSIONS連動の権限制御                                    |
+| local-llm/runner.ts   | Local LLM           | Ollama等のローカルLLMを直接呼び出し、ツール実行・ストリーミング対応                             |
+
+`backend-models.ts` はバックエンドごとのモデル一覧取得を共通化する。Codex App Serverの`model/list`、Cursor / Grok / Antigravityの各`models`コマンド、Local LLMのOllama / OpenAI互換endpointだけを利用し、取得機能がないCLIのモデル名は固定リストで補わない。`models-command.ts` が Discord / Slack / Web / Telegram / LINE 共通の読み取り専用 `/models [backend]` とAI向け `xangi tool models` を構成する。AIは `--use <model-id>` を指定すると、許可リストと動的取得結果を検証したうえで次のturnのモデルを選択できる。コマンド名は外部・Tool Serverとも `models` に統一する。
+
+`runtime-settings-command.ts` はチャットから変更可能なランタイム設定を構造化ディスパッチする。Discordのネイティブコマンド、Slackの`/backend`、AI向け`xangi tool runtime_settings`は同じ検証・保存処理を共有する。任意のスラッシュコマンド実行は許可せず、`backend` / `llmmode` / `autoreply` / `notify` / `threadmode` / `replysuggestions` / `respondtobots`だけを明示的に許可する。
 
 #### ワンショット CLI ランナー共通基盤（cli-runner-core.ts）
 
-claude-code / codex-cli / cursor-cli / grok-cli / antigravity-cli の 5 アダプターは、抽象基底クラス
+claude-code / codex-cli / opencode-cli / cursor-cli / grok-cli / antigravity-cli / github-copilot-cli の 7 アダプターは、抽象基底クラス
 `CliRunnerBase` の上に実装されている。基底クラスが以下を一手に引き受け、各アダプターは
 「コマンド引数の構築」と「JSONL イベントの解釈（`CliStreamParser`）」だけを実装する：
 
@@ -275,11 +374,11 @@ claude-code / codex-cli / cursor-cli / grok-cli / antigravity-cli の 5 アダ�
 
 LLMクライアントはOllamaネイティブAPIとOpenAI互換APIの2経路を持つ。ツール呼び出し時のメッセージフォーマットが異なる点に注意:
 
-| 項目 | OpenAI互換API | Ollama ネイティブAPI |
-|------|---------------|---------------------|
+| 項目                      | OpenAI互換API            | Ollama ネイティブAPI           |
+| ------------------------- | ------------------------ | ------------------------------ |
 | assistantのツール呼び出し | `tool_calls[].id` で識別 | `tool_calls[].function` で識別 |
-| toolメッセージの関連付け | `tool_call_id`（ID指定） | `tool_name`（名前指定） |
-| 変換関数 | `toOpenAIMessages()` | `toOllamaMessages()` |
+| toolメッセージの関連付け  | `tool_call_id`（ID指定） | `tool_name`（名前指定）        |
+| 変換関数                  | `toOpenAIMessages()`     | `toOllamaMessages()`           |
 
 Ollamaネイティブ経由では `toolCallId` → `tool_name` の逆引きマップで関連付けを行う。`toOllamaMessages()` は `chatOllamaNative` / `chatStreamOllamaNative` の両方から共通呼び出しされ、tool 履歴が streaming 経路でも欠落しない。
 
@@ -289,12 +388,12 @@ Ollamaネイティブ経由では `toolCallId` → `tool_name` の逆引きマ�
 
 `LLMChatOptions.toolChoice`:
 
-| 値 | 用途 |
-|---|---|
-| `'auto'` | LLM 判断（OpenAI デフォ） |
-| `'none'` | tool 呼ばずテキスト応答強制（最終応答用） |
-| `'required'` | 必ず tool を呼ぶ |
-| `{ type: 'function', function: { name } }` | 特定 tool を強制 |
+| 値                                         | 用途                                      |
+| ------------------------------------------ | ----------------------------------------- |
+| `'auto'`                                   | LLM 判断（OpenAI デフォ）                 |
+| `'none'`                                   | tool 呼ばずテキスト応答強制（最終応答用） |
+| `'required'`                               | 必ず tool を呼ぶ                          |
+| `{ type: 'function', function: { name } }` | 特定 tool を強制                          |
 
 `executeStreamLoop` の最終応答 chatStream では `toolChoice='none'` を指定し、tool ループ完了後に LLM が再度 tool を呼ぼうとして擬似 tool_call 文字列を text 漏れさせないようにする。Codex CLI は Responses API で streaming と tools/tool_choice を一体送信する設計（`codex-rs/core/src/client.rs` 参照）。xangi-dev は Chat Completions API のまま `tool_choice='none'` で同等の効果を得る。
 
@@ -308,11 +407,11 @@ Ollama ネイティブ API は OpenAI の `tool_choice` パラメータを公式
 
 `chat` / `chatStream` × OpenAI / Ollama の 4 経路で tools 注入・messages 変換が漏れなく同じ挙動になるよう、以下の共通ヘルパに集約している（`src/local-llm/llm-client.ts` モジュールトップ）:
 
-| ヘルパ | 用途 | 使用箇所 |
-|---|---|---|
-| `applyOpenAITools(body, options)` | OpenAI 形式 tools/tool_choice 注入 | `chatOpenAI`, `chatStream` (OpenAI 部) |
-| `applyOllamaTools(body, options)` | Ollama 形式 tools 注入 + `tool_choice='none'` エミュレート | `chatOllamaNative`, `chatStreamOllamaNative` |
-| `toOllamaMessages(messages)` | LLMMessage → Ollama 形式変換（images / tool_calls / tool_name 含む） | `chatOllamaNative`, `chatStreamOllamaNative` |
+| ヘルパ                            | 用途                                                                 | 使用箇所                                     |
+| --------------------------------- | -------------------------------------------------------------------- | -------------------------------------------- |
+| `applyOpenAITools(body, options)` | OpenAI 形式 tools/tool_choice 注入                                   | `chatOpenAI`, `chatStream` (OpenAI 部)       |
+| `applyOllamaTools(body, options)` | Ollama 形式 tools 注入 + `tool_choice='none'` エミュレート           | `chatOllamaNative`, `chatStreamOllamaNative` |
+| `toOllamaMessages(messages)`      | LLMMessage → Ollama 形式変換（images / tool_calls / tool_name 含む） | `chatOllamaNative`, `chatStreamOllamaNative` |
 
 新しい挙動（追加 tool_choice 値・新 message フィールド・新 provider 等）を入れる際は、共通ヘルパ 1 箇所を更新すれば 4 経路に反映される。テスト (`tests/local-llm-client-ollama-tools.test.ts`) は共通ヘルパの単体検証と Ollama 経路の payload 検証の両方をカバーする。
 
@@ -338,39 +437,39 @@ contextMaxChars = max(historyTokens * CHARS_PER_TOKEN, 8000)   # 1 token ≒ 3 c
 
 例: `NUM_CTX=32768` デフォ → `(32768 - 8000 - 4096 - 1000) * 3 = 59016 chars`
 
-| env | 役割 | デフォルト |
-|---|---|---|
-| `LOCAL_LLM_CONTEXT_MAX_CHARS` | 明示優先（unsetなら逆算） | 自動計算 |
-| `LOCAL_LLM_SYSTEM_PROMPT_BUDGET_TOKENS` | system prompt 想定枠 | `8000` |
-| `LOCAL_LLM_OUTPUT_BUDGET_TOKENS` | 1 リクエストの最大出力枠 | `4096` |
-| `LOCAL_LLM_SAFETY_MARGIN_TOKENS` | 安全マージン | `1000` |
-| `LOCAL_LLM_CONTEXT_KEEP_LAST` | 直近 N 件は trim しない | `10` |
-| `LOCAL_LLM_TOOL_RESULT_MAX_CHARS` | tool 結果の切り詰め | `4000` |
-| `LOCAL_LLM_MAX_SESSION_MESSAGES` | セッション最大メッセージ数 | `50` |
+| env                                     | 役割                       | デフォルト |
+| --------------------------------------- | -------------------------- | ---------- |
+| `LOCAL_LLM_CONTEXT_MAX_CHARS`           | 明示優先（unsetなら逆算）  | 自動計算   |
+| `LOCAL_LLM_SYSTEM_PROMPT_BUDGET_TOKENS` | system prompt 想定枠       | `8000`     |
+| `LOCAL_LLM_OUTPUT_BUDGET_TOKENS`        | 1 リクエストの最大出力枠   | `4096`     |
+| `LOCAL_LLM_SAFETY_MARGIN_TOKENS`        | 安全マージン               | `1000`     |
+| `LOCAL_LLM_CONTEXT_KEEP_LAST`           | 直近 N 件は trim しない    | `10`       |
+| `LOCAL_LLM_TOOL_RESULT_MAX_CHARS`       | tool 結果の切り詰め        | `4000`     |
+| `LOCAL_LLM_MAX_SESSION_MESSAGES`        | セッション最大メッセージ数 | `50`       |
 
 `ContextBudget` には計算根拠 (`source: 'explicit' | 'derived'`、各バジェット token 数) を含み、起動時にログ出力する。テスト・チューニング時の根拠追跡用。
 
-**チャンネル毎 LocalLlmMode override（backend-resolver.ts）:**
+**チャンネル毎 Local LLM override（backend-resolver.ts）:**
 
-`ChannelOverride.localLlmMode?: 'agent' | 'lite' | 'chat'` を `backend / model / effort` と同列に並べ、`CHANNEL_OVERRIDES` JSON で per-channel に Local LLM 動作モードを切替可能。
+`ChannelOverride.localLlmMode?: 'agent' | 'chat'` と `localLlmReasoningEffort` を `backend / model / effort` と同列に並べ、`CHANNEL_OVERRIDES` JSON で Local LLMの動作モードとOpenAI互換`reasoning_effort`をper-channelに切替可能。チャンネル指定がなければ`LOCAL_LLM_REASONING_EFFORT`、さらに未指定ならprovider既定を使う。
 
 ```json
 {
   "ch_id": {
     "backend": "local-llm",
     "model": "gemma4-26b-a4b-nvfp4",
-    "localLlmMode": "agent"
+    "localLlmMode": "agent",
+    "localLlmReasoningEffort": "low"
   }
 }
 ```
 
 `MODE_DEFAULTS` (runner.ts):
 
-| mode | tools | skills | xangiCommands | triggers |
-|---|---|---|---|---|
-| `agent` | ✅ | ✅ | ✅ | – |
-| `lite`  | ✅ | – | ✅ | ✅ |
-| `chat`  | – | – | – | – |
+| mode    | tools | skills | xangiCommands |
+| ------- | ----- | ------ | ------------- |
+| `agent` | ✅    | ✅     | ✅            |
+| `chat`  | –     | –      | –             |
 
 **per-call 適用フロー:**
 
@@ -387,7 +486,11 @@ buildSystemPrompt(flags) と llmTools = callFlags.tools ? getAllTools() : []
 
 **`/llmmode` slash コマンド（index.ts）:**
 
-`/llmmode <agent|lite|chat|default|show>` で対話的に per-channel mode を切替。`agent/lite/chat` は `BackendResolver.setChannelLocalLlmMode()` で in-memory + `.env` 永続化。`default` は override 削除。`show` は現在の resolved mode を表示。`ALLOW_LLM_MODE_COMMAND=false` で無効化可能（default `true`）。
+`/llmmode <agent|chat|default|show>` で対話的に per-channel mode を切替。`agent/chat` は `BackendResolver.setChannelLocalLlmMode()` で in-memory + `.env` 永続化。`default` は override 削除。`show` は現在の resolved mode を表示。`ALLOW_LLM_MODE_COMMAND=false` で無効化可能（default `true`）。
+
+**`/llmeffort` slash コマンド:**
+
+`/llmeffort <none|minimal|low|medium|high|xhigh|max|default|show>` は、親チャンネル単位の`localLlmReasoningEffort`をin-memoryと`.env`へ保存する。Local LLM runnerは各chat / streamリクエストへこの値を注入し、`LLMClient`がOpenAI互換bodyのトップレベル`reasoning_effort`へ変換する。`default`はチャンネルoverrideを削除する。
 
 **Tool 遅延ロード（tool_search、Codex / Claude Code 流）:**
 
@@ -402,11 +505,11 @@ buildSystemPrompt(flags) と llmTools = callFlags.tools ? getAllTools() : []
 
 `tool_search` 検索ロジック (`scoreToolMatch`):
 
-| マッチ種別 | スコア |
-|---|---|
-| name 完全一致 | 100 |
-| name 部分一致 | 50 |
-| name に query token 含む | +20 / token |
+| マッチ種別                      | スコア      |
+| ------------------------------- | ----------- |
+| name 完全一致                   | 100         |
+| name 部分一致                   | 50          |
+| name に query token 含む        | +20 / token |
 | description に query token 含む | +10 / token |
 
 スコア降順で上位 N 件 (`LOCAL_LLM_TOOL_SEARCH_LIMIT`、default 8) を `context.activateTools(names)` callback でセッションに追加。
@@ -417,7 +520,7 @@ buildSystemPrompt(flags) と llmTools = callFlags.tools ? getAllTools() : []
 interface ToolContext {
   workspace: string;
   channelId?: string;
-  activateTools?: (names: string[]) => void;  // tool_search が呼び出す
+  activateTools?: (names: string[]) => void; // tool_search が呼び出す
 }
 ```
 
@@ -425,10 +528,10 @@ interface ToolContext {
 
 env サマリ:
 
-| env | 役割 | デフォルト |
-|---|---|---|
-| `LOCAL_LLM_TOOL_SEARCH_ENABLED` | 機能の有効化 | `true` |
-| `LOCAL_LLM_TOOL_SEARCH_LIMIT` | 1 検索の最大ヒット数 | `8` |
+| env                             | 役割                                     | デフォルト                 |
+| ------------------------------- | ---------------------------------------- | -------------------------- |
+| `LOCAL_LLM_TOOL_SEARCH_ENABLED` | 機能の有効化                             | `true`                     |
+| `LOCAL_LLM_TOOL_SEARCH_LIMIT`   | 1 検索の最大ヒット数                     | `8`                        |
 | `LOCAL_LLM_ALWAYS_LOADED_TOOLS` | 常駐 tool 名 (CSV)、`tool_search` は強制 | builtin core + tool_search |
 
 無効化したい場合は `LOCAL_LLM_TOOL_SEARCH_ENABLED=false` で従来挙動（全 tool 常駐）に戻る。
@@ -439,12 +542,12 @@ env サマリ:
 
 一部のローカル LLM は tool_search で結果を得られないと同じ query で MAX_TOOL_ROUNDS まで無限ループし、最後に擬似 tool_call テキスト (`<|channel>thought\ncall:fn{args}<channel|>` / bare `call:fn{args}`) を hallucinate して最終応答に drift が漏れる構造的問題がある。単純な post-process strip では LLM 自身は「自分が無効な擬似 tool_call を吐いた」ことを知らず再発するので、**LLM にフィードバックして自己修正させるリカバリーループ**を実装。
 
-| Step | トリガー | 動作 |
-|---|---|---|
-| **A** (`tools.ts: toolSearchToolHandler`) | tool_search 実行 | tool マッチに加えて **skill** もマッチ対象に。skill hit があれば `read("skills/<name>/SKILL.md")` を案内。ノーヒット時は「同 query 繰り返し禁止 / 直接 read で skill 読め / plain text 応答」のガイダンスを返す |
-| **B** (`runner.ts: recordToolCallAndCheckLoop`) | 同一 (name, args) tool_call が 3 回連続 | `executeTool` をスキップして synthetic error result (`Tool '...' has been called 3 times consecutively...`) を LLM に返し、「Try: 別 args / 別 tool / plain text 応答」を強制 feedback |
+| Step                                                                                                                       | トリガー                                                                                                                         | 動作                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **A** (`tools.ts: toolSearchToolHandler`)                                                                                  | tool_search 実行                                                                                                                 | tool マッチに加えて **skill** もマッチ対象に。skill hit があれば `read("skills/<name>/SKILL.md")` を案内。ノーヒット時は「同 query 繰り返し禁止 / 直接 read で skill 読め / plain text 応答」のガイダンスを返す                                                                                                                                                                                                                                                                                                                                                                                              |
+| **B** (`runner.ts: recordToolCallAndCheckLoop`)                                                                            | 同一 (name, args) tool_call が 3 回連続                                                                                          | `executeTool` をスキップして synthetic error result (`Tool '...' has been called 3 times consecutively...`) を LLM に返し、「Try: 別 args / 別 tool / plain text 応答」を強制 feedback                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | **C** (`runner.ts: 最終 chatStream + pseudo-toolcall.ts: parsePseudoToolCall / isSafeForRescue / buildStructuredFeedback`) | 最終 chatStream に **strict drift** (`call:fn{}` / `<\|channel\|>...<\|channel\|>` / `<\|tool_call\|>...<\|tool_call\|>`) を検出 | drift から `(name, args)` を parse 試行。**(i) parse 成功 + read-only allowlist OK** → 該当 tool を実 executeTool で救済実行し、結果を `[RESCUED TOOL RESULT]` system message として context に注入、chatStream を再生成。**(ii) parse 成功 + 副作用/危険判定** → `{kind, attempted_tool, attempted_args, reason, hint, allowed_actions}` の構造化エラーレコードを `[SYSTEM ERROR RECORD]` デリミタ付きで system に積み、chatStream を再生成。**(iii) parse 失敗 / 冪等キャッシュ HIT / loop 検出** → 対応 `kind` (`unparseable_pseudo_call` / `already_executed`) の構造化レコードを返す。Kmax=2 で繰り返す |
-| **D** (`runner.ts: 最終出力差し替え + FRIENDLY_FALLBACK_MESSAGE`) | Step C を Kmax=2 回繰り返しても strict drift しか出ない | `stripPseudoToolCalls` 後に意味のあるテキストが残れば採用、空なら `FRIENDLY_FALLBACK_MESSAGE` (「ごめん、うまく応答を組み立てられなかった。質問をシンプルにして、もう一度試してくれる？」) に差し替え。raw 内容は `console.warn` でログに残す |
+| **D** (`runner.ts: 最終出力差し替え + FRIENDLY_FALLBACK_MESSAGE`)                                                          | Step C を Kmax=2 回繰り返しても strict drift しか出ない                                                                          | `stripPseudoToolCalls` 後に意味のあるテキストが残れば採用、空なら `FRIENDLY_FALLBACK_MESSAGE` (「ごめん、うまく応答を組み立てられなかった。質問をシンプルにして、もう一度試してくれる？」) に差し替え。raw 内容は `console.warn` でログに残す                                                                                                                                                                                                                                                                                                                                                                |
 
 drift 分類:
 
@@ -457,14 +560,14 @@ Session に `recentToolCallSigs: string[]` (バッファ 8 件、push 押し出�
 
 Step B (exact 3 回連続) を起点に、以下の 6 機構が同じ tool 繰り返し・擬似 tool_call drift 表示・bot 意図消失・context 膨張の穴を埋める。
 
-| 機構 | トリガー | 動作 |
-|---|---|---|
-| exact 検出 | 同一 `(name, args)` tool_call が 3 回連続 (`REPEATED_TOOL_CALL_THRESHOLD=3`) | `repeatedToolCallErrorMessage`: 「別 args / 別 tool / plain text 応答」のいずれかを強制 feedback |
-| 冪等キャッシュ | `exec` / `bash` / `python` の `command` / `script` / `code` に冪等パターン (`wc -[clmw]` / `base64` / `(md5\|sha1\|sha224\|sha256\|sha384\|sha512)sum` / `urllib.parse.(quote\|unquote)` / `hashlib` / `printf '%[bs]'`) を含み、副作用パターン (`> redirect` / `rm` / `mv` / `curl` / `git` / `docker` / `kill` 等) を含まない | 2 回目以降は `exec` をスキップして 1 回目の結果を即返却。`Session.idempotentResultCache: Map<string, string>` (FIFO、上限 `IDEMPOTENT_CACHE_LIMIT=32`) |
-| similar 検出 | 正規化シグネチャ (lowercase / 数字→`n` / ASCII 句読点→空白 / 連続空白圧縮) の文字 trigram Jaccard 類似度が `SIMILAR_SIGNATURE_THRESHOLD=0.85` 以上のエントリが直近 `RECENT_TOOL_CALL_BUFFER=8` 件中 `SIMILAR_LOOP_MATCH_COUNT=2` 件以上 | `similarToolCallErrorMessage`: small wording tweaks では結果変わらない旨を明示して別 intent/別 tool/終了 を促す。`Session.recentNormSigs: string[]` で正規化履歴を保持 |
-| streaming hold buffer | streaming chunk 受信時に partial drift pattern (`<\|channel` open のみ / 末尾 `call:fn{...` / 末尾 `thought\n`) を検出 | partial 部分を hold (Discord 表示停止)、次 chunk で完全な strict drift と確定したら drop、通常 text と分かった時点で release。stream 終了時に残骸を `flush()` して最終応答 `fullText` にマージ (Step C/D の検証に通す) |
-| context prune | `trimSession` 内で context 圧縮時に、直近 `contextKeepLast` (=10) 件以外の古い `tool` メッセージを検出 | 古い tool 結果を `[<tool>] (M chars, pruned from old turn)` 形式の 1 行サマリに置換 (本文削除)。同一 file path の `read` 重複は最新のみ本文保持、それ以外は `(deduped - see latest read of same path below)`。短い結果 (< 200 char) と既に pruned 済はスキップで idempotent。KV cache 効率改善 |
-| pseudo tool_call rescue + structured feedback | 最終 chatStream で strict drift を検出 (Step C) | drift から `(name, args)` を parse 試行 → `isSafeForRescue` で allowlist 判定 → **(i) safe** なら該当 tool を実 executeTool で救済実行し `[RESCUED TOOL RESULT]` で context 注入、**(ii) unsafe** なら `{kind, attempted_tool, attempted_args, reason, hint, allowed_actions}` の構造化レコードを `[SYSTEM ERROR RECORD]` デリミタ付きで system 注入、**(iii) parse 失敗 / cache HIT / loop 検出** は対応 `kind` (`unparseable_pseudo_call` / `already_executed`) の構造化レコードを返す。Kmax=2 で繰り返し、超過時のみ `FRIENDLY_FALLBACK_MESSAGE` (Step D) |
+| 機構                                          | トリガー                                                                                                                                                                                                                                                                                                                        | 動作                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| exact 検出                                    | 同一 `(name, args)` tool_call が 3 回連続 (`REPEATED_TOOL_CALL_THRESHOLD=3`)                                                                                                                                                                                                                                                    | `repeatedToolCallErrorMessage`: 「別 args / 別 tool / plain text 応答」のいずれかを強制 feedback                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 冪等キャッシュ                                | `exec` / `bash` / `python` の `command` / `script` / `code` に冪等パターン (`wc -[clmw]` / `base64` / `(md5\|sha1\|sha224\|sha256\|sha384\|sha512)sum` / `urllib.parse.(quote\|unquote)` / `hashlib` / `printf '%[bs]'`) を含み、副作用パターン (`> redirect` / `rm` / `mv` / `curl` / `git` / `docker` / `kill` 等) を含まない | 2 回目以降は `exec` をスキップして 1 回目の結果を即返却。`Session.idempotentResultCache: Map<string, string>` (FIFO、上限 `IDEMPOTENT_CACHE_LIMIT=32`)                                                                                                                                                                                                                                                                                                                                                                                                       |
+| similar 検出                                  | 正規化シグネチャ (lowercase / 数字→`n` / ASCII 句読点→空白 / 連続空白圧縮) の文字 trigram Jaccard 類似度が `SIMILAR_SIGNATURE_THRESHOLD=0.85` 以上のエントリが直近 `RECENT_TOOL_CALL_BUFFER=8` 件中 `SIMILAR_LOOP_MATCH_COUNT=2` 件以上                                                                                         | `similarToolCallErrorMessage`: small wording tweaks では結果変わらない旨を明示して別 intent/別 tool/終了 を促す。`Session.recentNormSigs: string[]` で正規化履歴を保持                                                                                                                                                                                                                                                                                                                                                                                       |
+| streaming hold buffer                         | streaming chunk 受信時に partial drift pattern (`<\|channel` open のみ / 末尾 `call:fn{...` / 末尾 `thought\n`) を検出                                                                                                                                                                                                          | partial 部分を hold (Discord 表示停止)、次 chunk で完全な strict drift と確定したら drop、通常 text と分かった時点で release。stream 終了時に残骸を `flush()` して最終応答 `fullText` にマージ (Step C/D の検証に通す)                                                                                                                                                                                                                                                                                                                                       |
+| context prune                                 | `trimSession` 内で context 圧縮時に、直近 `contextKeepLast` (=10) 件以外の古い `tool` メッセージを検出                                                                                                                                                                                                                          | 古い tool 結果を `[<tool>] (M chars, pruned from old turn)` 形式の 1 行サマリに置換 (本文削除)。同一 file path の `read` 重複は最新のみ本文保持、それ以外は `(deduped - see latest read of same path below)`。短い結果 (< 200 char) と既に pruned 済はスキップで idempotent。KV cache 効率改善                                                                                                                                                                                                                                                               |
+| pseudo tool_call rescue + structured feedback | 最終 chatStream で strict drift を検出 (Step C)                                                                                                                                                                                                                                                                                 | drift から `(name, args)` を parse 試行 → `isSafeForRescue` で allowlist 判定 → **(i) safe** なら該当 tool を実 executeTool で救済実行し `[RESCUED TOOL RESULT]` で context 注入、**(ii) unsafe** なら `{kind, attempted_tool, attempted_args, reason, hint, allowed_actions}` の構造化レコードを `[SYSTEM ERROR RECORD]` デリミタ付きで system 注入、**(iii) parse 失敗 / cache HIT / loop 検出** は対応 `kind` (`unparseable_pseudo_call` / `already_executed`) の構造化レコードを返す。Kmax=2 で繰り返し、超過時のみ `FRIENDLY_FALLBACK_MESSAGE` (Step D) |
 
 API: `recordToolCallAndDetectLoop(session, sig)` が `{ kind: 'none' \| 'exact' \| 'similar', repeats? }` を返し、`executeRunLoop` / `executeStreamLoop` 両方で `kind` 別エラーメッセージ (`repeatedToolCallErrorMessage` / `similarToolCallErrorMessage`) を振り分ける。`recordToolCallAndCheckLoop` は boolean wrapper として温存 (後方互換)。`compactOldToolResults(session, recentKeepCount)` は `{ compactedCount, bytesReclaimed }` を返し、`trimSession` の冒頭で呼ばれる。`parsePseudoToolCall(text)` は anchored grammar で `call:fn{args}` を `{name, args}` に分解し失敗時 `null` を返す。`isSafeForRescue(name, args)` は `{safe, reason?}` を返す。
 
@@ -485,11 +588,11 @@ API: `recordToolCallAndDetectLoop(session, sig)` が `{ kind: 'none' \| 'exact' 
 
 `isSafeForRescue(name, args)` は擬似 tool_call の救済実行可否を判定する。denylist (`rm/curl/git` 等を弾く) は抜け道が多いため使わず、明示的な allowlist のみを許可:
 
-| カテゴリ | 対象 |
-|---|---|
-| read-only tool 直接 | `read` / `glob` / `grep` / `tool_search` / `discord_history` / `web_history` / `slack_history` / `discord_channels` / `discord_search` / `schedule_list` |
-| `exec` / `bash` のサブコマンド | `xangi-cmd {discord_history,web_history,slack_history,discord_channels,discord_search,schedule_list,system_settings}` のいずれかで始まる場合のみ |
-| shell metacharacter | `\|` / `&` / `;` / `` ` `` / `$` / `<` / `>` / `$(...)` / `&&` / `\|\|` / `>` リダイレクトが含まれていたら即 reject |
+| カテゴリ                       | 対象                                                                                                                                                                                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| read-only tool 直接            | `read` / `glob` / `grep` / `tool_search` / `discord_history` / `discord_message` / `web_history` / `slack_history` / `discord_channels` / `discord_search` / `slack_channels` / `slack_search` / `schedule_list`                            |
+| `exec` / `bash` のサブコマンド | `xangi tool {discord_history,discord_message,web_history,slack_history,discord_channels,discord_search,slack_channels,slack_search,schedule_list,system_settings,models}` のいずれかで始まる場合のみ（`models --use` は変更操作なので除外） |
+| shell metacharacter            | `\|` / `&` / `;` / `` ` `` / `$` / `<` / `>` / `$(...)` / `&&` / `\|\|` / `>` リダイレクトが含まれていたら即 reject                                                                                                                         |
 
 それ以外は `{safe: false, reason}` を返し、`unsafe_tool_in_pseudo_format` 構造化エラーで LLM に proper function_calling 構造への切替を促す。
 
@@ -504,16 +607,22 @@ API: `recordToolCallAndDetectLoop(session, sig)` が `{ kind: 'none' \| 'exact' 
 - `already_executed`: 同一シグネチャが冪等キャッシュ HIT / loop 検出 (再実行禁止)
 - `unparseable_pseudo_call`: drift 検出されたが parse 失敗 (malformed args / 不明形式)
 
-#### ワークスペース hooks (Stop hook ゲート)
+#### ワークスペース hooks
 
-多段防御が「ツール呼び出しの形」を守る層なのに対し、hooks は「応答の中身とツール実行の整合」を検証する層。ターン終了時に外部プロセス (hook) へ最終応答テキストと実行済みツール一覧を渡し、block が返ったらフィードバックを system message として注入して 1 回だけ継続ラウンドを回す。
+共通の設定loaderの下で、イベントごとに入力・出力契約を分離する。`UserPromptSubmit`は`DynamicRunnerManager`で全バックエンドのLLM実行前に発火し、`Stop`はLocal LLMのターン終了時検証を担当する。
+
+- `UserPromptSubmit`: platform adapterの未展開`userText`をstdin JSONで外部プロセスへ渡し、exit 0のstdoutを未信頼の補助contextとして元prompt末尾へ加える。複数hookは独立に並列実行し、設定順で結合する。`UserPromptSubmit`は各turn前、`Stop`は各gate前に設定を再評価するため、追加・削除は再起動なしで次のhook eventから反映する。不正な一時状態では直前の正常設定を維持する
+- 安全な起動: `file + args[]`を`shell:false`で実行し、ユーザー入力をcommand/argvへ展開しない。子プロセスenvは`getSafeEnv()`のallowlistに限定する
+- 全バックエンド共通配線: `DynamicRunnerManager.run()` / `runStream()`がbackend解決後、内部runnerへ委譲する直前に実行する。`userText`が無い内部実行ではskipする
+- 量と遅延の上限: timeoutは既定5秒・上限10秒、LLM投入はhookごとに既定10,000文字・設定上限50,000文字、全hook合計20,000文字、captureは64KB。異常はそのhookだけfail-openでskipする
+- `Stop`: ターン終了時に最終応答テキストと実行済みツール一覧を渡し、blockが返ったらフィードバックをsystem messageとして注入して1回だけ継続ラウンドを回す
 
 - 契約は Claude Code / Codex CLI の Stop hook と互換 (stdin JSON、exit 0 + `{"decision":"block","reason":"..."}` または exit 2 + stderr)。同じ hook スクリプトをランタイム間で共用できる
 - xangi 拡張として `tools_called` (このターンで実際に実行されたツール名リスト、実行順) を payload に含める。ハーネス自身がツール実行を把握しているため、hook 側で transcript を parse する必要がない
 - フェイルオープン: hook 側の異常 (タイムアウト / 不正出力 / spawn 失敗 / 設定ファイル破損) はすべて素通り。ガードが本体応答を wedge しない
 - モード連動: ツール無効モード (chat) ではゲート自体をスキップする。継続ラウンドでフィードバックに対処する手段が無い状態で block すると、LLM が擬似 tool_call テキストで対処しようとして応答品質が落ちるため (実機観察)
 - 1 ターン 1 ナッジ: 継続ラウンドの結果は再チェックしない。hook は「強制」ではなく「ターン終了前に確認を 1 回挟む」装置
-- 実装: `src/hooks.ts` (設定ロード + `StopHookRunner`)、`LocalLlmRunner.applyStopHookGate()` (`run` / `runStream` 両経路に配線)。発火は tool trajectory に `stop_hook_block` イベントで記録される
+- 実装: `src/hooks.ts` (共通設定ロード + イベント別runner)、`src/dynamic-runner.ts` (`UserPromptSubmit`)、`LocalLlmRunner.applyStopHookGate()` (`Stop`)。Stop発火はtool trajectoryに`stop_hook_block`イベントで記録される
 - 履歴整合: block 時は `assistant(元応答)` → `system(feedback)` → `assistant(継続応答)` の順にセッション履歴へ積まれ、次ターン以降の文脈でも「何が起きたか」が追える
 
 #### Observability: tool trajectory
@@ -545,6 +654,7 @@ env で OFF (`XANGI_TOOL_TRAJECTORY_LOG=false`) にすればロガーは完全 n
 │ - agentRunners: Map<platform, fn> # AI実行関数     │
 ├─────────────────────────────────────────────────────┤
 │ + add(schedule): Schedule                          │
+│ + update(id, schedule): Schedule                   │
 │ + remove(id): boolean                              │
 │ + toggle(id): Schedule                             │
 │ + list(): Schedule[]                               │
@@ -554,18 +664,23 @@ env で OFF (`XANGI_TOOL_TRAJECTORY_LOG=false`) にすればロガーは完全 n
 ```
 
 **スケジュールの種類:**
+
 - `cron`: cron式による定期実行
 - `once`: 単発リマインダー（指定時刻に1回実行）
+- `startup`: xangi起動時に実行
 
 **永続化:**
+
 - JSONファイル（`${DATA_DIR}/schedules.json`）
 - ファイル変更を監視して自動リロード（debounce付き）
 
 **タイムゾーン:**
+
 - サーバーのシステムタイムゾーン（`TZ` 環境変数）に従う
 - Docker環境では `TZ=Asia/Tokyo` 等を設定推奨
 
 **実行の堅牢化:**
+
 - 再発火ガード: 前回の実行が走っている間に同じスケジュールの cron が発火した場合はスキップ（長時間ジョブの重複実行・多重投稿防止）
 - 一時的なネットワークエラー（DNS 一時失敗・接続タイムアウト等）はバックオフ後に 1 回だけ自動リトライ。エージェント側のタイムアウトや利用上限はリトライしない
 
@@ -575,19 +690,22 @@ AI CLIが xangi の機能（Discord操作・スケジュール・システム）
 
 ```
 AI CLI（Claude Code等）
-  → xangi-cmd（シェルスクリプト）
+  → xangi tool（正規CLI。xangi-cmdは互換shim）
   → HTTP POST http://localhost:<port>/api/execute
   → tool-server（xangiプロセス内）
   → Discord REST API / スケジューラー / 設定
 ```
 
 **ポート管理:**
+
 - 前回使用ポートを dataDir に保存して再起動時に再利用（resume されたセッションの古い `XANGI_TOOL_SERVER` 参照を生かす）。使用中なら OS 自動割り当てにフォールバック、`XANGI_TOOL_SERVER_PORT` で固定も可能
 - 起動したURLを `XANGI_TOOL_SERVER` として子プロセスへ注入
-- `xangi-cmd` は `XANGI_TOOL_SERVER` を使って接続
+- `xangi tool` は `XANGI_TOOL_SERVER` を使って接続
+- `XANGI_TOOL_SERVER` が無い場合は接続先を推測せずエラー終了し、別instanceへの誤接続を防ぐ
 - 現在のチャンネルIDなどの実行文脈は HTTP リクエストの `context` に載せて tool-server へ渡す
 
 **セキュリティ:**
+
 - DISCORD_TOKEN 等のシークレットは xangi プロセス内のみ
 - AI CLI には `safe-env.ts` のホワイトリストで安全な環境変数のみ渡す
 - GitHub App秘密鍵は起動時にメモリに読み込み、トークン生成は tool-server の `/github-token` エンドポイント経由（短寿命トークンのみ取得可能）
@@ -600,40 +718,29 @@ AI CLI（Claude Code等）
 外部プロセス（ビルドスクリプト / CI / 監視 cron）
   → HTTP POST /api/trigger（Bearer トークン認証）
   → EventTrigger（検証・レート制限）
-  → scheduler に登録済みの agentRunner(prompt, channelId)
-  → エージェントターン実行 → チャンネルに結果投稿
+  → scheduler に登録済みの agentRunner(prompt, channelId, ..., delivery callback)
+  → エージェントターン実行 → プラットフォームに結果投稿 → 配信receipt永続化
 ```
 
 **設計判断:**
-- ターン実行は scheduler の `agentRunner` 経路を再利用する。プラットフォームごとの投稿処理（thinking メッセージ・分割・添付）を持つ実行関数が既に scheduler に登録されているため、トリガー側は `Scheduler.getAgentRunner(platform)` で取得して呼ぶだけでよい
+
+- ターン実行は scheduler の `agentRunner` 経路を再利用する。プラットフォームごとの投稿処理（thinking メッセージ・分割・添付・Stop / 延長 / 残り時間表示）を持つ実行関数が既に scheduler に登録されているため、トリガー側は `Scheduler.getAgentRunner(platform)` で取得して呼ぶだけでよい
+- Webは`web-chat:<sessionId>`と生の`sessionId`の両方を受け付け、runner呼び出し前に生のappSessionIdへ正規化する。これによりtrigger起点のターンも既存Web会話のtranscriptへ追加される
 - HTTP 応答（`202` + `triggerId`）はターン完了を待たない fire-and-forget。呼び出し側（ビルドスクリプト等）をブロックしない
+- `GET /api/trigger/:id`と`xangi tool trigger_status`は、`accepted` / `running` / `completed` / `delivered` / `failed` / `interrupted`を共通形式で返す。配信参照は`platform`、`destinationId`、任意の`messageIds` / `sessionId`で表し、Discord固有型を中核へ持ち込まない
+- receiptは`${DATA_DIR}/trigger-receipts.json`へアトミック保存し、直近1000件を再起動後も照会できる
 - 発火時に `⚡ trigger: <source>` ラベルをチャンネルへ先行投稿し、何が起動したか可視化する
 
 **セキュリティ:**
+
 - `TRIGGER_ENABLED`（デフォルト false）の明示 opt-in
 - HTTP 経由は `XANGI_TRIGGER_TOKEN` の Bearer 認証必須。トークン未設定時は有効化されていても全拒否（tool-server は 0.0.0.0 bind のため、無認証受け付けはネットワーク越しの任意プロンプト注入になる）。トークン比較は定数時間比較
-- `xangi-cmd trigger`（`/api/execute` 経由）はローカルコマンドの既存の信頼境界に従いトークン検証を省略するが、opt-in は同様に要求
+- `xangi tool trigger`（`/api/execute` 経由）はローカルコマンドの既存の信頼境界に従いトークン検証を省略するが、opt-in は同様に要求
 - 暴走防止: source 単位のレート制限（`TRIGGER_MIN_INTERVAL_MS`、デフォルト 10 秒、超過 `429`）と同時実行ガード（同一 source 実行中は `409`）。メッセージ長上限 4000 文字
-
-### 承認フロー（approval.ts / approval-server.ts）
-
-AIが実行しようとするコマンドの中から危険なもの（`rm -rf`、`git push --force` 等）を検知し、実行前にユーザーの承認を求める仕組み。
-
-```
-AI CLI がコマンド出力
-  → approval.ts がパターンマッチ（approval-patterns.json）
-  → 危険コマンド検知
-  → approval-server.ts がDiscord/Slackにボタン付きメッセージ送信
-  → ユーザーが承認/拒否
-  → 結果をAI CLIに返却
-```
-
-- `APPROVAL_ENABLED=true` で有効化（デフォルト無効）
-- パターンは `src/approval-patterns.json` で定義
 
 ### GitHub App認証（github-auth.ts）
 
-GitHub Appの秘密鍵を使ってInstallation Token（短寿命・1時間有効）を生成し、`gh` CLIをラップする。
+GitHub Appの秘密鍵を使ってInstallation Token（短寿命・1時間有効）を生成し、`gh` CLI と GitHub HTTPS 向け `git` credential をラップする。
 
 ```
 gh コマンド実行（AI CLI内）
@@ -641,25 +748,19 @@ gh コマンド実行（AI CLI内）
   → curl で tool-server の /github-token エンドポイントにリクエスト
   → github-auth.ts がメモリ上の秘密鍵でトークン生成
   → GH_TOKEN として注入 → 本物の gh を exec
+
+git fetch/push/ls-remote 等（AI CLI内）
+  → /tmp/xangi-gh-wrapper/git（ラッパー）
+  → 既存 credential helper を無効化し、GitHub HTTPS 用 helper を指定
+  → Git が credential を要求した時だけ /github-token にリクエスト
+  → x-access-token ユーザー + installation token を返す
 ```
 
 - 秘密鍵は起動時にファイルからメモリに読み込み、以降ファイルアクセス不要
 - AIエージェント（子プロセス）からは秘密鍵に直接アクセスできない
 - トークン生成失敗時はPATへのフォールバックなし（エラー）
-
-### トリガー機能（local-llm/triggers.ts）
-
-Local LLMのchatモードで、LLM応答テキスト内のマジックワードを検出してスクリプトを自動実行する。
-
-```
-triggers/
-├── my-trigger/
-│   ├── trigger.yaml    # name, description, handler を定義
-│   └── handler.sh      # 実行スクリプト
-```
-
-- ワークスペースの `triggers/` ディレクトリから `trigger.yaml` を読み込み
-- LLM応答テキストにトリガーワードが含まれていれば handler を実行
+- ラッパーディレクトリは子プロセスの `PATH` 先頭へ固定し、`BASH_ENV` でも再適用する。非対話 shell の起動時に rc file 等が `PATH` を組み直しても、通常の `gh` / `git` がラッパーを shadow しないようにする
+- `git` ラッパーは GitHub HTTPS credential のみを対象にし、SSH remote には介入しない
 
 ### スキルシステム（skills.ts）
 
@@ -690,14 +791,23 @@ skills/
    ↓
 5. チャンネル情報・発言者情報を付与
    ↓
-6. AI CLIに転送（processPrompt）
+6. providerセッションの初回だけ直近履歴を先読み
+   - Discord: channel / thread history
+   - Slack: conversations.history / conversations.replies
+   - Web: session JSONL
    ↓
-7. レスポンス処理
+7. AI CLIに転送（processPrompt）
+   ↓
+8. レスポンス処理
    - ストリーミング表示
    - ファイル添付抽出（MEDIA:パターン）
    ↓
-8. ユーザーに返信
+9. ユーザーに返信
 ```
+
+先読み結果は引用データ境界でpromptに含め、履歴内の命令文をsystem指示として扱わない。`HISTORY_PREFETCH_ENABLED` と `HISTORY_PREFETCH_COUNT` は3プラットフォーム共通。区間別レイテンシは `logs/turn-latency/<platform>.jsonl` に記録する。
+
+Codex backendでは、CLIの`turn.started`、toolの`item.started` / `item.completed`、`turn.completed`を同じレコードの`backend_trace`へ保存する。`tool_wall_ms`はtool実行区間の重複をまとめた実時間、`non_tool_backend_ms`はbackend turn全体からtool区間を引いた時間で、モデル推論とCLI orchestrationの両方を含む。toolの入力と出力本文は保存せず、tool名、経過時刻、終了状態、exit code、出力byte数だけを記録する。backendが対応イベントを提供しない場合、`backend_trace`は省略する。
 
 ### スケジュール実行フロー
 
@@ -721,18 +831,18 @@ skills/
 
 xangiのユーザー管理はシンプルな許可リスト方式：
 
-- `DISCORD_ALLOWED_USER` / `SLACK_ALLOWED_USER` でアクセス制御
+- 各platformの`*_ALLOWED_USER`（Discord / Slack / LINE / Telegram）でアクセス制御
 - カンマ区切りで複数ユーザー指定可能、`*` で全員許可
 - セッションはチャンネル単位で管理
-- プロンプトに発言者情報（表示名・Discord ID）が自動注入される
+- プロンプトにplatform固有の発言者情報（表示名・ユーザーID）が自動注入される
 
 ### AI CLIの抽象化
 
 AI CLIの実装詳細を隠蔽し、交換可能に：
 
-```typescript
-// 設定でバックエンドを切り替え
-AGENT_BACKEND=claude-code  # or codex / cursor / grok / antigravity / local-llm
+```bash
+# 設定でバックエンドを切り替え
+AGENT_BACKEND=claude-code # or a built-in / linked extension backend ID
 ```
 
 将来的に新しいAI CLIが登場しても、アダプターを追加するだけで対応可能。
@@ -741,18 +851,18 @@ AGENT_BACKEND=claude-code  # or codex / cursor / grok / antigravity / local-llm
 
 AIが出力する特殊コマンドを検出して自動実行：
 
-| 方式 | コマンド例 | 動作 |
-|------|----------|------|
-| CLIツール | `xangi-cmd discord_send --channel ID --message "..."` | Discord操作 |
-| CLIツール | `xangi-cmd discord_buttons --channel ID --message "..." --buttons "..."` | ボタン付きメッセージ送信 |
-| CLIツール | `xangi-cmd schedule_add --input "毎日 9:00 ..."` | スケジュール操作 |
-| CLIツール | `xangi-cmd system_restart` | プロセス再起動 |
-| テキストパース | `MEDIA:/path/to/file` | ファイル送信 |
-| テキストパース | `\n===\n` | メッセージ分割 |
-| スラッシュコマンド | `/autoreply` | チャンネルごとのメンションなし応答トグル |
-| スラッシュコマンド | `/respondtobots` | bot 同士の応答 ON/OFF トグル（ホワイトリストは `RESPOND_TO_BOTS`、連続上限は `RESPOND_TO_BOTS_MAX_CONSECUTIVE`） |
+| 方式               | コマンド例                                             | 動作                                                                                                                                              |
+| ------------------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CLIツール          | `xangi tool discord_send --channel ID --message "..."` | Discordメッセージ送信                                                                                                                             |
+| CLIツール          | `xangi tool schedule_add ...` / `schedule_update ...`  | スケジュールの追加・更新                                                                                                                          |
+| CLIツール          | `xangi tool system_restart`                            | プロセス再起動                                                                                                                                    |
+| テキストパース     | `MEDIA:/path/to/file`                                  | ファイル送信                                                                                                                                      |
+| テキストパース     | `\n===\n`                                              | メッセージ分割                                                                                                                                    |
+| スラッシュコマンド | `/autoreply`                                           | チャンネルごとのメンションなし応答を ON/OFF/default/表示（`settings.json` に永続化）                                                              |
+| スラッシュコマンド | `/respondtobots`                                       | bot 同士の応答 ON/OFF トグル（ホワイトリストは `RESPOND_TO_BOTS`、連続上限は `RESPOND_TO_BOTS_MAX_CONSECUTIVE`）                                  |
+| スラッシュコマンド | `/threadmode`                                          | チャンネルごとの Discord 発言ごとスレッド返信モードを ON/OFF/default/表示（`settings.json` に永続化、全体デフォルトは `DISCORD_REPLY_IN_THREAD`） |
 
-CLIツール（`xangi-cmd`）は xangi 内蔵の tool-server（HTTPエンドポイント）経由で実行される。
+CLIツール（`xangi tool`）は xangi 内蔵の tool-server（HTTPエンドポイント）経由で実行される。
 DISCORD_TOKEN 等のシークレットは xangi プロセス内に閉じ込められ、AI CLI からはアクセスできない。
 
 ### 添付ファイル抽出（read leniently, attach narrowly）
@@ -767,9 +877,11 @@ AI の応答テキストからファイルパスを拾って添付する処理�
 2. 寛容パーサ = `extractFilePaths`。LLM が send_file を呼ばず応答テキストに添付意図を書いた場合の救済。対象は **明示マーカーのみ**:
    - `MEDIA:path`
    - `[IMAGE:|FILE:|VIDEO:|AUDIO:|MEDIA:path]`（角括弧マーカー）
-   - `![alt](path)` / `[label](path)`（markdown）
+   - `![alt](path)`（markdown画像）
+   - 通常の `[label](path)` は参照リンクとして本文に残し、ローカルの実在ファイルを指していても添付しない。ファイル本体を送る場合は上記の明示マーカーか `send_file` を使う。
    - マーカー無しの「裸パス」を散文から拾う tier は **設けない**。誤添付（本文中のパス文字列が意図せず添付される）リスクの割に得るものが少なく、攻撃面を広げるため。
 3. サンドボックス = 上記いずれの候補も `fs.realpathSync` で正規化してから allowlist ルート（WORKSPACE subtree 全体・添付保存先・`/tmp`・`ATTACHMENT_ALLOWED_DIRS`）との `startsWith` 判定。`..`・symlink によるサンドボックス脱出を防ぎ、存在確認・ファイル/ディレクトリ判定も兼ねる。
+   - 実在するが allowlist 外の候補は添付せず、ローカル絶対パスをチャットへ露出しない一般化した警告を表示する。失敗を黙殺しない一方で、allowlist の自動拡張や迂回送信は行わない。
 
 - 相対パスは `WORKSPACE_PATH` 基準で解決（従来は cwd 基準で取りこぼしていた）。
 - 寛容化と同時に「絶対パス無条件添付の穴」を塞いでいる点が重要（寛容化だけ入れるとむしろセキュリティが緩むため）。
@@ -786,35 +898,35 @@ AI の応答テキストからファイルパスを拾って添付する処理�
 
 ### 永続化戦略
 
-| データ | 保存先 | 形式 |
-|--------|--------|------|
-| スケジュール | `${DATA_DIR}/schedules.json` | JSON |
-| ランタイム設定 | `${WORKSPACE}/settings.json` | JSON |
-| セッション | `${DATA_DIR}/sessions.json` | JSON（appSessionId方式、activeByContext + sessions） |
-| トランスクリプト | `logs/sessions/{appSessionId}.jsonl` | JSONL（セッション単位の会話ログ） |
-| DATA_DIR ロック | `${DATA_DIR}.lock/` | `proper-lockfile` が管理するロックディレクトリ（同 `DATA_DIR` を複数 xangi で握ろうとした際の重複検知用、30s ハートビート + 60s stale で自動回収） |
-| 環境変数 (`.env`) | デフォルト: `process.cwd()/.env` / 上書き: `XANGI_ENV_PATH` env var | KEY=VALUE 行 |
+| データ            | 保存先                                                              | 形式                                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| スケジュール      | `${DATA_DIR}/schedules.json`                                        | JSON                                                                                                                                                      |
+| ランタイム設定    | `${DATA_DIR}/settings.json`                                         | JSON                                                                                                                                                      |
+| セッション        | `${DATA_DIR}/sessions.json`                                         | JSON（appSessionId方式、activeByContext + sessions）                                                                                                      |
+| トランスクリプト  | `logs/sessions/{appSessionId}.jsonl`                                | JSONL（セッション単位の会話ログ）                                                                                                                         |
+| DATA_DIR ロック   | `${DATA_DIR}.lock/`                                                 | `DATA_DIR`作成後に`proper-lockfile`が取得するロックディレクトリ（取得不能なら外部接続・scheduler開始前に起動中止、30sハートビート + 60s staleで自動回収） |
+| 環境変数 (`.env`) | デフォルト: `process.cwd()/.env` / 上書き: `XANGI_ENV_PATH` env var | KEY=VALUE 行                                                                                                                                              |
 
 #### 環境変数の永続化と Docker のセキュリティ設計
 
-`/autoreply` / `/respondtobots` / `/backend` 等の slash command が触る「設定の持続」は **2 層構造** で動作する。混同しがちなので明示的に整理する:
+`/autoreply` / `/notify` / `/threadmode` は `settings.json`、`/respondtobots` / `/backend` / `/llmmode` は `.env` 書き戻しを使う。Discord スレッド内では、`/autoreply`だけがスレッドIDの設定を読み書きし、未設定時は親チャンネルの値を継承する。`/notify` / `/threadmode` / `/backend` / `/llmmode` は従来どおり親チャンネルIDを対象にする。`.env` 側の「設定の持続」は **2 層構造** で動作する。混同しがちなので明示的に整理する:
 
 **層 1: 起動時の env vars 注入 (常に有効)**
 
 ホスト側 `.env` の値は Docker の `env_file` ディレクティブ経由で起動時に env vars として container に注入される。これはファイル書き戻しとは独立で動き、Docker でもローカルでも常に有効:
 
-- ホスト `.env` の `AUTO_REPLY_CHANNELS=...` などの初期値は、container の `process.env.AUTO_REPLY_CHANNELS` として起動時に確実に読まれる
+- ホスト `.env` の初期値は、container の `process.env` として起動時に確実に読まれる
 - container 再起動時にもう一度同じ env vars が注入されるため、**初期値は再起動でも維持される**
 - ホスト `.env` を変更して container を再起動すれば新しい設定が反映される (= デプロイの正規ルート)
 
 **層 2: 稼働中の動的書き戻し (Docker default では skip)**
 
-`/autoreply` 等の slash command でメモリ上の設定を切り替えたとき、その変更をホスト `.env` に書き戻すかどうかは `resolveEnvFilePath()` (`src/env-persist.ts`) で決まる:
+`/respondtobots` / `/backend` / `/llmmode` 等の slash command でメモリ上の設定を切り替えたとき、その変更をホスト `.env` に書き戻すかどうかは `resolveEnvFilePath()` (`src/env-persist.ts`) で決まる:
 
-| 環境 | デフォルト挙動 |
-|------|--------------|
-| ローカル直接実行 | `process.cwd()/.env` を読み書き → 動的変更も `.env` に保存され再起動後も維持 |
-| Docker | `process.cwd() = /app` だが `/app/.env` は存在しないため書き戻し失敗 → メモリ上の変更のみ、再起動で層 1 の初期値に戻る (= 安全側 default) |
+| 環境             | デフォルト挙動                                                                                                                            |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| ローカル直接実行 | `process.cwd()/.env` を読み書き → 動的変更も `.env` に保存され再起動後も維持                                                              |
+| Docker           | `process.cwd() = /app` だが `/app/.env` は存在しないため書き戻し失敗 → メモリ上の変更のみ、再起動で層 1 の初期値に戻る (= 安全側 default) |
 
 Docker で書き戻しを skip するのは意図的な設計で、コンテナ外からの slash command で稼働中コンテナのイメージ層に書き戻しを発生させない（イメージ再ビルドや再 deploy ライフサイクルを破らない）ためのセキュリティガード。`updateEnvKeyValue()` は ENOENT を例外じゃなく `{ok: false, reason}` で返し、呼び出し側は `console.warn` で「永続化されなかった」ことだけログに残す。
 
@@ -836,6 +948,7 @@ services:
 xangi独自の `appSessionId` でセッションを管理。backendの `providerSessionId`（Claude Code等）は後付けで保存。
 
 **sessions.json の構造：**
+
 ```json
 {
   "activeByContext": { "<contextKey>": "<appSessionId>" },
@@ -843,7 +956,7 @@ xangi独自の `appSessionId` でセッションを管理。backendの `provider
     "<appSessionId>": {
       "id": "<appSessionId>",
       "title": "...",
-      "platform": "discord|slack|web",
+      "platform": "discord|slack|web|line|telegram",
       "contextKey": "<channelId>",
       "agent": { "backend": "claude-code", "providerSessionId": "..." }
     }
@@ -856,6 +969,7 @@ xangi独自の `appSessionId` でセッションを管理。backendの `provider
 セッション単位のAI会話ログをJSONL形式で自動保存。デバッグ・障害分析・WebUI閲覧に使用。
 
 **ディレクトリ構成：**
+
 ```
 logs/sessions/
   m4abc123_def456.jsonl   # セッション単位のログ
@@ -863,35 +977,41 @@ logs/sessions/
 ```
 
 **記録される内容：**
+
 - `user`: ユーザーから送信されたプロンプト
 - `assistant`: AI の最終応答
 - `error`: タイムアウト、API エラーなど
 
 **注意事項：**
+
 - ログは `.gitignore` で除外されている
-- 自動ローテーション（日付ごとにディレクトリ分割）
+- 1セッションにつき`logs/sessions/<appSessionId>.jsonl`へ追記
 - ログ書き込み失敗は無視（本体の動作に影響させない）
 
-## ファイル構成
+## 主要ファイル構成
+
+以下は責務を理解するための代表的な構成であり、全ファイルの固定一覧ではない。現在の全ファイルは`rg --files src`で確認する。
 
 ```
 bin/
-└── xangi-cmd           # CLIラッパー（シェルスクリプト、tool-serverに中継）
+├── xangi               # 正規CLI（session/service/tool。managed版は同梱Nodeを使用）
+└── xangi-cmd           # xangi toolへ中継する後方互換shim
 
 src/
 ├── index.ts            # エントリーポイント（起動シーケンス）
 ├── stream-session.ts   # ストリーミング表示の共通コア（思考表示/更新スロットリング、Discord/Slack/Web で使用）
 ├── stream-finalizer.ts # プロセス終了時に実行中ストリーミング表示を「中断」表示で確定させる registry
+├── tool-history.ts     # Turn Historyの表示整形（旧ツール履歴APIとの互換処理を含む）
 ├── message-split.ts    # 文字数上限に合わせたテキスト分割
 ├── discord/            # Discord統合
 │   ├── ui.ts               # ボタン行・タイムアウトUI・処理中メッセージ管理
-│   ├── tool-history.ts     # ツール履歴の整形・蓄積（TOOL_HISTORY_MAX_LINES で表示制限）
 │   ├── message-utils.ts    # リンク展開・返信元引用・チャンネルメンション展開
 │   ├── message-handler.ts  # MessageCreate/Update/Delete + processPrompt
 │   ├── slash-commands.ts   # スラッシュコマンド定義・Interaction処理
 │   └── scheduler-bridge.ts # スケジューラのDiscord送信・実行関数登録
 ├── slack.ts            # Slack統合
 ├── line.ts             # LINE Bot統合（Webhook + 署名検証）
+├── telegram.ts         # Telegram Bot統合（polling / webhook + 監視ルール）
 ├── web-chat.ts         # WebチャットUI（HTTPサーバー）
 ├── agent-runner.ts     # AI CLIインターフェース
 ├── base-runner.ts      # システムプロンプト生成
@@ -901,22 +1021,35 @@ src/
 ├── claude-code.ts      # Claude Codeアダプター（per-request）
 ├── persistent-runner.ts # Claude Codeアダプター（常駐プロセス）
 ├── codex-cli.ts        # Codex CLIアダプター
+├── opencode-cli.ts     # OpenCodeアダプター
 ├── cursor-cli.ts       # Cursor CLIアダプター
 ├── grok-cli.ts         # Grok CLIアダプター
+├── antigravity-cli.ts  # Antigravity CLIアダプター
+├── github-copilot-cli.ts # GitHub Copilot CLIアダプター
 ├── cli-process.ts      # 単発CLI runnerのprocess/env/timeout共通部品
 ├── jsonl-buffer.ts     # JSONL streamの行分割共通部品
 ├── runner-manager.ts   # 複数チャンネル同時処理（RunnerManager）
 ├── dynamic-runner.ts   # 動的ランナーマネージャー
 ├── backend-resolver.ts # チャンネル別バックエンド解決
+├── backend-models.ts   # backend別の利用可能モデル動的取得・共通表示
+├── backend-effort.ts   # backend別effortの検証・正規化
+├── models-command.ts   # 全platform共通/modelsとAI向けmodel選択
+├── data-dir-lock.ts    # DATA_DIRの単一writer lockとheartbeat
+├── self-lifecycle.ts   # 自己restart許可の判定
+├── shutdown.ts         # graceful shutdownの共通制御
+├── web-projects.ts     # Web Projectの定義・永続化
+├── extension-repository.ts # 公開GitHub extensionの固定取得・検証・catalog永続化
+├── extension-update.ts     # repository管理extensionの会話起点更新・rollback transaction
+├── web-slash-commands.ts # Web Chatコマンドregistry
+├── workspace-browser.ts # Workspace閲覧・編集の境界
 ├── hooks.ts            # ワークスペースhooks（Stop hook 外部検証ゲート）
 ├── tool-server.ts      # Tool Server（AI CLI向けHTTP API）
 ├── event-trigger.ts    # イベントトリガー（POST /api/trigger で外部からターン起動）
 ├── events-emitter.ts   # 応答ライフサイクルイベントの event bus
 ├── events-stream-server.ts # Pull型SSE配信（GET /api/events/stream、web-chatに相乗り）
+├── activity-store.ts   # 現在ターンの軽量スナップショット＋途中コメント/ツールの時系列永続化
 ├── pet-inbox-server.ts # xangi-pets からのテキスト送信受付（POST /api/pet/inbox）
 ├── even-terminal-server.ts # Even Terminal 互換 HTTP API
-├── approval.ts         # 危険コマンド検知（パターンマッチ）
-├── approval-server.ts  # 承認サーバー（Discord/Slack対話的承認フロー）
 ├── github-auth.ts      # GitHub App認証（秘密鍵メモリ管理・トークン生成）
 ├── safe-env.ts         # 環境変数ホワイトリスト
 ├── env-persist.ts      # .env パス解決と動的書き戻し（XANGI_ENV_PATH）
@@ -926,7 +1059,6 @@ src/
 ├── tool-call-sanitize.ts # 表示テキストに漏れたツールコール構文の除去
 ├── access-urls.ts      # 起動時に表示する Web UI アクセスURL解決
 ├── constants.ts        # アプリケーション定数
-├── schedule-cli.ts     # スケジューラCLI（レガシー、tool-server移行済み）
 ├── cli/                # CLIモジュール（tool-serverから呼ばれる）
 │   ├── discord-api.ts  #   Discord REST API直叩き
 │   ├── schedule-cmd.ts #   スケジュール操作
@@ -935,7 +1067,9 @@ src/
 │   ├── web-history-cmd.ts      # Web Chat履歴取得
 │   ├── inter-chat-cmd.ts       # インスタンス間チャット操作
 │   ├── terminal-session-cmd.ts # ターミナルセッション操作
-│   └── xangi-cmd.ts    #   Node.js版CLIエントリーポイント
+│   ├── xangi.ts        #   人間向けターミナルCLIエントリーポイント
+│   ├── tool-command.ts #   tool-server用共通dispatcher
+│   └── xangi-cmd.ts    #   後方互換エントリーポイント
 ├── inter-instance-chat/ # インスタンス間チャット（per-instance jsonl / auto-talk / 履歴ビューア）
 ├── local-llm/          # Local LLMアダプター
 │   ├── runner.ts       #   メインランナー（セッション管理・ツール実行ループ）
@@ -944,7 +1078,6 @@ src/
 │   ├── tools.ts        #   ビルトインツール（exec/read/write/edit/glob/grep/send_file/web_fetch）
 │   ├── xangi-tools.ts  #   xangi専用ツール（function calling版）
 │   ├── image-utils.ts  #   画像処理ユーティリティ（マルチモーダル対応）
-│   ├── triggers.ts     #   トリガー機能（chatモードのマジックワード検出・実行）
 │   ├── pseudo-toolcall.ts #  擬似tool_callテキストの解析・救済（rescue allowlist）
 │   └── types.ts        #   型定義
 ├── tool-trajectory/    # ツール実行軌跡の観測ログ（logs/tool-trajectory/*.jsonl）
@@ -953,10 +1086,11 @@ src/
 │   ├── xangi-commands.ts          # プラットフォーム別組み立て
 │   ├── xangi-commands-common.ts   # 共通（タイムアウト等）
 │   ├── xangi-commands-chat-platform.ts # チャットPF共通（MEDIA:/スケジュール/システム）
-│   ├── xangi-commands-discord.ts  # Discord専用（xangi-cmd discord_*）
+│   ├── xangi-commands-discord.ts  # Discord専用（xangi tool discord_*）
 │   ├── xangi-commands-slack.ts    # Slack専用
 │   ├── xangi-commands-web.ts      # Web専用
 │   ├── xangi-commands-line.ts     # LINE専用
+│   ├── xangi-commands-telegram.ts # Telegram専用
 │   ├── chat-system-persistent.ts  # 常駐プロセス用システムプロンプト
 │   ├── chat-system-resume.ts      # セッション再開用システムプロンプト
 │   ├── platform-labels.ts         # プラットフォーム表示名
@@ -1005,9 +1139,9 @@ src/
 ### セキュリティ方針
 
 - 非rootユーザー（UID 1000）で実行
-- ワークスペースのみマウント
+- ワークスペースに加え、選択したbackendの認証情報、prompt、git設定、任意のsecret・inter-chat共有先を必要な範囲でマウント
 - AIエージェントへの環境変数はホワイトリスト方式で制限（`src/safe-env.ts`）
-- ホストネットワークへの直接アクセスなし（ollamaコンテナ経由のみ）
+- `host.docker.internal`へのhost-gatewayを設定する。公開範囲は各serviceとhost側firewallで制限
 
 詳細（環境変数一覧・Docker操作方法等）は [使い方ガイド](usage.md) を参照。
 

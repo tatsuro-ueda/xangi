@@ -1,4 +1,17 @@
-import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import {
+  appendFileSync,
+  closeSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
 
 /**
@@ -26,12 +39,99 @@ export interface TranscriptEntry {
   platformMessageId?: string;
 }
 
-function getSessionLogPath(workdir: string, appSessionId: string): string {
-  const dir = join(workdir, 'logs', 'sessions');
+let centralDataDir: string | null = null;
+let legacyStartupWorkdir: string | null = null;
+
+/**
+ * Runtime transcript storage is process-global and follows DATA_DIR, not the
+ * workspace selected for an individual session. Tests and standalone callers
+ * that do not initialize it retain the historical workdir-based behavior.
+ */
+export function initTranscriptStorage(dataDir: string, startupWorkdir: string): void {
+  centralDataDir = dataDir;
+  legacyStartupWorkdir = startupWorkdir;
+}
+
+export function resetTranscriptStorageForTests(): void {
+  centralDataDir = null;
+  legacyStartupWorkdir = null;
+}
+
+function transcriptDirectory(root: string): string {
+  return join(root, 'logs', 'sessions');
+}
+
+export function isValidTranscriptSessionId(appSessionId: string): boolean {
+  return (
+    appSessionId.length > 0 &&
+    appSessionId !== '.' &&
+    appSessionId !== '..' &&
+    !appSessionId.includes('/') &&
+    !appSessionId.includes('\\') &&
+    !appSessionId.includes('\0')
+  );
+}
+
+function transcriptFileName(appSessionId: string): string {
+  if (!isValidTranscriptSessionId(appSessionId)) {
+    throw new Error('Invalid transcript session ID');
+  }
+  return `${appSessionId}.jsonl`;
+}
+
+function getSessionLogPathForWrite(workdir: string, appSessionId: string): string {
+  const dir = transcriptDirectory(centralDataDir ?? workdir);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
-  return join(dir, `${appSessionId}.jsonl`);
+  const fileName = transcriptFileName(appSessionId);
+  const destination = join(dir, fileName);
+  if (centralDataDir && !existsSync(destination)) {
+    const legacy = [legacyStartupWorkdir]
+      .filter(Boolean)
+      .map((root) => join(transcriptDirectory(root as string), fileName))
+      .find((candidate) => candidate !== destination && existsSync(candidate));
+    if (legacy) {
+      try {
+        copyFileSync(legacy, destination, constants.COPYFILE_EXCL);
+      } catch (error) {
+        const code =
+          error && typeof error === 'object' && 'code' in error
+            ? (error as NodeJS.ErrnoException).code
+            : undefined;
+        if (code !== 'EEXIST') throw error;
+      }
+    }
+  }
+  return destination;
+}
+
+export function getTranscriptDirectories(workdir: string): string[] {
+  const roots = centralDataDir ? [centralDataDir, legacyStartupWorkdir] : [workdir];
+  return [...new Set(roots.filter(Boolean) as string[])]
+    .map(transcriptDirectory)
+    .filter(existsSync);
+}
+
+export function getSessionLogPathForRead(workdir: string, appSessionId: string): string {
+  const fileName = transcriptFileName(appSessionId);
+  for (const dir of getTranscriptDirectories(workdir)) {
+    const candidate = join(dir, fileName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return join(transcriptDirectory(centralDataDir ?? workdir), fileName);
+}
+
+export function deleteSessionTranscript(workdir: string, appSessionId: string): boolean {
+  const fileName = transcriptFileName(appSessionId);
+  let deleted = false;
+  for (const dir of getTranscriptDirectories(workdir)) {
+    const candidate = join(dir, fileName);
+    if (!existsSync(candidate)) continue;
+    unlinkSync(candidate);
+    deleted = true;
+  }
+  return deleted;
 }
 
 function generateMessageId(): string {
@@ -40,7 +140,7 @@ function generateMessageId(): string {
 
 function writeEntry(workdir: string, appSessionId: string, entry: TranscriptEntry): void {
   try {
-    const filePath = getSessionLogPath(workdir, appSessionId);
+    const filePath = getSessionLogPathForWrite(workdir, appSessionId);
     const line = JSON.stringify(entry);
     appendFileSync(filePath, line + '\n');
   } catch (err) {
@@ -93,7 +193,7 @@ export function logError(workdir: string, appSessionId: string, error: string): 
  */
 export function readSessionMessages(workdir: string, appSessionId: string): TranscriptEntry[] {
   try {
-    const filePath = getSessionLogPath(workdir, appSessionId);
+    const filePath = getSessionLogPathForRead(workdir, appSessionId);
     if (!existsSync(filePath)) return [];
     const content = readFileSync(filePath, 'utf-8');
     return content
@@ -105,15 +205,173 @@ export function readSessionMessages(workdir: string, appSessionId: string): Tran
   }
 }
 
+/**
+ * セッション末尾のメッセージだけを読み出す。
+ * JSONLの末尾から64KiBずつ遡り、必要な行数が揃った時点でI/Oを止める。
+ */
+export function readSessionMessagesTail(
+  workdir: string,
+  appSessionId: string,
+  limit: number,
+  before = 0
+): TranscriptEntry[] {
+  if (limit <= 0) return [];
+  const safeBefore = Math.max(0, Math.floor(before));
+  let fd: number | undefined;
+  try {
+    const filePath = getSessionLogPathForRead(workdir, appSessionId);
+    if (!existsSync(filePath)) return [];
+    fd = openSync(filePath, 'r');
+    let position = statSync(filePath).size;
+    let content = '';
+    while (position > 0) {
+      const chunkSize = Math.min(64 * 1024, position);
+      position -= chunkSize;
+      const chunk = Buffer.allocUnsafe(chunkSize);
+      readSync(fd, chunk, 0, chunkSize, position);
+      content = chunk.toString('utf-8') + content;
+      const lineCount = content.split('\n').filter((line) => line.trim()).length;
+      if (lineCount >= limit + safeBefore) break;
+    }
+    const lines = content.split('\n').filter((line) => line.trim());
+    const end = Math.max(0, lines.length - safeBefore);
+    return lines
+      .slice(Math.max(0, end - limit), end)
+      .map((line) => JSON.parse(line) as TranscriptEntry);
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+export interface TranscriptPage {
+  entries: TranscriptEntry[];
+  hasMore: boolean;
+  nextCursor: number | null;
+}
+
+/**
+ * JSONLを末尾（または前ページ先頭のbyte offset）から読む安定カーソル版。
+ * cursorはabsolute byte offsetなので、取得中に末尾へ追記されても次ページがずれない。
+ */
+export function readSessionMessagesPage(
+  workdir: string,
+  appSessionId: string,
+  limit: number,
+  cursor?: number
+): TranscriptPage {
+  if (limit <= 0) return { entries: [], hasMore: false, nextCursor: null };
+  let fd: number | undefined;
+  try {
+    const filePath = getSessionLogPathForRead(workdir, appSessionId);
+    if (!existsSync(filePath)) return { entries: [], hasMore: false, nextCursor: null };
+    fd = openSync(filePath, 'r');
+    const fileSize = statSync(filePath).size;
+    const end = Number.isFinite(cursor)
+      ? Math.min(fileSize, Math.max(0, Math.floor(cursor as number)))
+      : fileSize;
+    let position = end;
+    let newlineCount = 0;
+    const chunks: Buffer[] = [];
+    while (position > 0 && newlineCount < limit + 2) {
+      const chunkSize = Math.min(64 * 1024, position);
+      position -= chunkSize;
+      const chunk = Buffer.allocUnsafe(chunkSize);
+      readSync(fd, chunk, 0, chunkSize, position);
+      chunks.unshift(chunk);
+      for (const byte of chunk) {
+        if (byte === 0x0a) newlineCount++;
+      }
+    }
+
+    const content = Buffer.concat(chunks);
+    const segments: Array<{ start: number; end: number }> = [];
+    let lineStart = 0;
+    for (let index = 0; index <= content.length; index++) {
+      if (index !== content.length && content[index] !== 0x0a) continue;
+      let lineEnd = index;
+      if (lineEnd > lineStart && content[lineEnd - 1] === 0x0d) lineEnd--;
+      if (lineEnd > lineStart) segments.push({ start: lineStart, end: lineEnd });
+      lineStart = index + 1;
+    }
+    // 任意chunk境界から始まった先頭断片はJSONL 1行として扱わない。
+    if (position > 0 && segments.length > 0) segments.shift();
+
+    const selected = segments.slice(-(limit + 1));
+    const hasMore = position > 0 || selected.length > limit;
+    const pageSegments = selected.length > limit ? selected.slice(1) : selected;
+    const entries = pageSegments.map(
+      (segment) =>
+        JSON.parse(
+          content.subarray(segment.start, segment.end).toString('utf-8')
+        ) as TranscriptEntry
+    );
+    const nextCursor = hasMore && pageSegments.length > 0 ? position + pageSegments[0].start : null;
+    return { entries, hasMore, nextCursor };
+  } catch {
+    return { entries: [], hasMore: false, nextCursor: null };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 /** transcript ファイル全体を書き換える (edit / delete 用) */
 function rewriteSessionFile(
   workdir: string,
   appSessionId: string,
   entries: TranscriptEntry[]
 ): void {
-  const filePath = getSessionLogPath(workdir, appSessionId);
+  const filePath = getSessionLogPathForWrite(workdir, appSessionId);
   const lines = entries.map((e) => JSON.stringify(e)).join('\n');
   writeFileSync(filePath, entries.length > 0 ? lines + '\n' : '');
+}
+
+/**
+ * ユーザーに表示するassistantメッセージを、最後のuserターンに応答がない場合だけ
+ * transcriptへ補完する。外部プラットフォームではmessage IDを指定し、Webでは省略する。
+ *
+ * runnerが最終応答をすでに保存している場合は本文を上書きせず、
+ * platformMessageIdだけを補う。再起動finalizerなど、プラットフォーム側では
+ * メッセージを確定できたがrunnerが完了しなかった経路で使う。
+ */
+export function ensureVisibleAssistantResponse(
+  workdir: string,
+  appSessionId: string,
+  platformMessageId: string | undefined,
+  visibleText: string,
+  createdAt = new Date().toISOString()
+): TranscriptEntry | null {
+  const entries = readSessionMessages(workdir, appSessionId);
+  let lastUserIndex = -1;
+  for (let index = entries.length - 1; index >= 0; index--) {
+    if (entries[index].role === 'user') {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  if (lastUserIndex === -1) return null;
+
+  const existingAssistant = entries
+    .slice(lastUserIndex + 1)
+    .find((entry) => entry.role === 'assistant');
+  if (existingAssistant) {
+    if (platformMessageId && !existingAssistant.platformMessageId) {
+      existingAssistant.platformMessageId = platformMessageId;
+      rewriteSessionFile(workdir, appSessionId, entries);
+    }
+    return existingAssistant;
+  }
+
+  const entry: TranscriptEntry = {
+    id: generateMessageId(),
+    role: 'assistant',
+    content: { result: visibleText },
+    createdAt,
+    ...(platformMessageId ? { platformMessageId } : {}),
+  };
+  writeEntry(workdir, appSessionId, entry);
+  return entry;
 }
 
 /**
@@ -134,6 +392,31 @@ export function updateMessageContent(
   entry.content = newContent;
   entry.edited = true;
   entry.editedAt = new Date().toISOString();
+  rewriteSessionFile(workdir, appSessionId, entries);
+  return entry;
+}
+
+/**
+ * 最新の対象roleへusageを付与する。自動計測値向けなので「編集済み」にはしない。
+ */
+export function updateLatestMessageUsage(
+  workdir: string,
+  appSessionId: string,
+  roles: readonly TranscriptEntry['role'][],
+  usage: Record<string, unknown>
+): TranscriptEntry | null {
+  const entries = readSessionMessages(workdir, appSessionId);
+  let index = -1;
+  for (let candidate = entries.length - 1; candidate >= 0; candidate--) {
+    if (roles.includes(entries[candidate].role)) {
+      index = candidate;
+      break;
+    }
+  }
+  if (index === -1) return null;
+
+  const entry = entries[index];
+  entry.usage = { ...entry.usage, ...usage };
   rewriteSessionFile(workdir, appSessionId, entries);
   return entry;
 }

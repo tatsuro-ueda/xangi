@@ -79,6 +79,26 @@ const discordHistoryHandler: ToolHandler = {
   },
 };
 
+const discordMessageHandler: ToolHandler = {
+  name: 'discord_message',
+  description:
+    '履歴に表示されたメッセージIDを使い、特定のDiscordメッセージ本文を省略せず取得する。channel省略時は現在のチャンネルを使う。',
+  parameters: {
+    type: 'object',
+    properties: {
+      channel: { type: 'string', description: 'チャンネルID（省略時は現在のチャンネル）' },
+      'message-id': { type: 'string', description: '取得するメッセージID' },
+    },
+    required: ['message-id'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = { 'message-id': String(args['message-id']) };
+    if (args.channel) flags.channel = String(args.channel);
+    const env = context.channelId ? { XANGI_CHANNEL_ID: context.channelId } : undefined;
+    return runXangiCmd(['discord_message', ...flagsToArgs(flags)], env);
+  },
+};
+
 const discordSendHandler: ToolHandler = {
   name: 'discord_send',
   description: '指定チャンネルにメッセージを送信する。',
@@ -185,6 +205,25 @@ const discordDeleteHandler: ToolHandler = {
   },
 };
 
+const discordThreadLeaveHandler: ToolHandler = {
+  name: 'discord_thread_leave',
+  description:
+    'スレッドから指定ユーザーを退出させる（Discordの「このスレッドを退出」と同じ＝そのユーザーのサイドバーから消える）。channel 省略時は現在のスレッドが対象。user は必須で、自分を退出させたい場合は発言者のユーザーIDを渡す。',
+  parameters: {
+    type: 'object',
+    properties: {
+      user: { type: 'string', description: '退出させるユーザーID（必須。自分＝発言者のIDを渡す）' },
+      channel: { type: 'string', description: 'スレッドID（省略時は現在のスレッド）' },
+    },
+    required: ['user'],
+  },
+  async execute(args): Promise<ToolResult> {
+    const cmd = ['discord_thread_leave', '--user', String(args.user)];
+    if (args.channel) cmd.push('--channel', String(args.channel));
+    return runXangiCmd(cmd);
+  },
+};
+
 // ─── Schedule Tools ─────────────────────────────────────────────────
 
 const scheduleListHandler: ToolHandler = {
@@ -199,33 +238,76 @@ const scheduleListHandler: ToolHandler = {
   },
 };
 
-const scheduleAddHandler: ToolHandler = {
-  name: 'schedule_add',
+function schedulePlatformEnv(platform?: ChatPlatform): Record<string, string> | undefined {
+  return platform === 'discord' || platform === 'slack' || platform === 'telegram'
+    ? { XANGI_PLATFORM: platform }
+    : undefined;
+}
+
+function createScheduleAddHandler(defaultPlatform?: ChatPlatform): ToolHandler {
+  return {
+    name: 'schedule_add',
+    description:
+      'スケジュールを追加する。例: "30分後 ミーティング", "15:00 レビュー", "毎日 9:00 おはよう", "cron 0 9 * * * おはよう"',
+    parameters: {
+      type: 'object',
+      properties: {
+        input: {
+          type: 'string',
+          description: 'スケジュール設定（例: "毎日 9:00 おはよう"）',
+        },
+        channel: { type: 'string', description: '送信先チャンネルID' },
+        platform: {
+          type: 'string',
+          description: 'プラットフォーム（discord/slack/telegram）',
+          enum: ['discord', 'slack', 'telegram'],
+        },
+      },
+      required: ['input', 'channel'],
+    },
+    async execute(args): Promise<ToolResult> {
+      const flags: Record<string, string> = {
+        input: String(args.input),
+        channel: String(args.channel),
+      };
+      if (args.platform) flags.platform = String(args.platform);
+      return runXangiCmd(
+        ['schedule_add', ...flagsToArgs(flags)],
+        schedulePlatformEnv(defaultPlatform)
+      );
+    },
+  };
+}
+
+const scheduleUpdateHandler: ToolHandler = {
+  name: 'schedule_update',
   description:
-    'スケジュールを追加する。例: "30分後 ミーティング", "15:00 レビュー", "毎日 9:00 おはよう", "cron 0 9 * * * おはよう"',
+    '既存スケジュールをIDを維持したまま更新する。未指定項目は保持される。本文だけならmessage、日時・種別も変えるならinputを指定する。',
   parameters: {
     type: 'object',
     properties: {
+      id: { type: 'string', description: 'スケジュールID' },
       input: {
         type: 'string',
-        description: 'スケジュール設定（例: "毎日 9:00 おはよう"）',
+        description: '日時・種別・本文をまとめて更新する自然言語設定',
       },
-      channel: { type: 'string', description: '送信先チャンネルID' },
+      message: { type: 'string', description: '日時・種別を変えずに更新する本文' },
+      channel: { type: 'string', description: '新しい送信先チャンネルID' },
       platform: {
         type: 'string',
-        description: 'プラットフォーム（discord/slack）',
-        enum: ['discord', 'slack'],
+        description: '新しいプラットフォーム（変更時はchannelも必須）',
+        enum: ['discord', 'slack', 'telegram', 'web'],
       },
     },
-    required: ['input', 'channel'],
+    required: ['id'],
   },
   async execute(args): Promise<ToolResult> {
-    const flags: Record<string, string> = {
-      input: String(args.input),
-      channel: String(args.channel),
-    };
-    if (args.platform) flags.platform = String(args.platform);
-    return runXangiCmd(['schedule_add', ...flagsToArgs(flags)]);
+    const flags: Record<string, string> = { id: String(args.id) };
+    if (args.input !== undefined) flags.input = String(args.input);
+    if (args.message !== undefined) flags.message = String(args.message);
+    if (args.channel !== undefined) flags.channel = String(args.channel);
+    if (args.platform !== undefined) flags.platform = String(args.platform);
+    return runXangiCmd(['schedule_update', ...flagsToArgs(flags)]);
   },
 };
 
@@ -287,13 +369,26 @@ const mediaSendHandler: ToolHandler = {
 
 const systemRestartHandler: ToolHandler = {
   name: 'system_restart',
-  description: 'xangiを再起動する（autoRestartが有効な場合のみ）。',
+  description:
+    'xangiを再起動する（管理者が.envでXANGI_SELF_LIFECYCLE=restart-onlyを設定している場合のみ）。',
   parameters: {
     type: 'object',
     properties: {},
   },
   async execute(): Promise<ToolResult> {
     return runXangiCmd(['system_restart']);
+  },
+};
+
+const webStatusHandler: ToolHandler = {
+  name: 'web_status',
+  description: '現在のWeb UIアクセス先、bind、port、Chat・WorkspaceのHTTP状態を取得する。',
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+  async execute(): Promise<ToolResult> {
+    return runXangiCmd(['web_status']);
   },
 };
 
@@ -316,6 +411,80 @@ const systemSettingsHandler: ToolHandler = {
     return runXangiCmd(cliArgs);
   },
 };
+
+const extensionUninstallHandler: ToolHandler = {
+  name: 'extension_uninstall',
+  description:
+    '承認済みのworkspace cleanup後、現在のxangi instanceでextensionを停止・unlinkして完了状態を検証する。',
+  parameters: {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: '削除するextension ID' },
+    },
+    required: ['id'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd(['extension_uninstall', '--id', String(args.id)]);
+  },
+};
+
+function createRuntimeSettingsHandler(defaultPlatform?: ChatPlatform): ToolHandler {
+  return {
+    name: 'runtime_settings',
+    description:
+      'ユーザーが明示した場合に、許可されたランタイム設定を確認・変更する。任意のスラッシュコマンドは実行しない。',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: '設定名',
+          enum: [
+            'backend',
+            'llmmode',
+            'autoreply',
+            'notify',
+            'threadmode',
+            'replysuggestions',
+            'respondtobots',
+          ],
+        },
+        action: {
+          type: 'string',
+          description: '操作',
+          enum: ['show', 'set', 'reset'],
+        },
+        value: { type: 'string', description: '設定値' },
+        backend: { type: 'string', description: 'backend設定時のbackend' },
+        model: { type: 'string', description: 'backend設定時のmodel' },
+        effort: { type: 'string', description: 'backend設定時のeffort' },
+        channel: { type: 'string', description: '設定対象チャンネルID' },
+        platform: {
+          type: 'string',
+          description: '対象プラットフォーム',
+          enum: ['discord', 'slack', 'web', 'line', 'telegram'],
+        },
+      },
+      required: ['name', 'action'],
+    },
+    async execute(args, context): Promise<ToolResult> {
+      const flags: Record<string, string> = {
+        name: String(args.name),
+        action: String(args.action),
+      };
+      for (const key of ['value', 'backend', 'model', 'effort', 'channel', 'platform']) {
+        if (args[key] !== undefined) flags[key] = String(args[key]);
+      }
+      const env: Record<string, string> = {};
+      if (context.channelId) env.XANGI_CHANNEL_ID = context.channelId;
+      if (defaultPlatform) env.XANGI_PLATFORM = defaultPlatform;
+      return runXangiCmd(
+        ['runtime_settings', ...flagsToArgs(flags)],
+        Object.keys(env).length > 0 ? env : undefined
+      );
+    },
+  };
+}
 
 // ─── History Tools ──────────────────────────────────────────────────
 
@@ -370,17 +539,126 @@ const slackHistoryHandler: ToolHandler = {
   },
 };
 
+const slackSendHandler: ToolHandler = {
+  name: 'slack_send',
+  description: '指定Slackチャンネルにメッセージを送信する。thread-ts指定でスレッド返信もできる。',
+  parameters: {
+    type: 'object',
+    properties: {
+      channel: { type: 'string', description: 'SlackチャンネルID（省略時は現在のチャンネル）' },
+      message: { type: 'string', description: '送信するメッセージ' },
+      'thread-ts': { type: 'string', description: '返信先スレッドのts（任意）' },
+    },
+    required: ['message'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = { message: String(args.message) };
+    if (args.channel) flags.channel = String(args.channel);
+    if (args['thread-ts']) flags['thread-ts'] = String(args['thread-ts']);
+    const env = context.channelId ? { XANGI_CHANNEL_ID: context.channelId } : undefined;
+    return runXangiCmd(['slack_send', ...flagsToArgs(flags)], env);
+  },
+};
+
+const slackChannelsHandler: ToolHandler = {
+  name: 'slack_channels',
+  description: 'Slackチャンネル一覧を取得する。',
+  parameters: {
+    type: 'object',
+    properties: {
+      types: {
+        type: 'string',
+        description: '取得対象（例: public_channel,private_channel。デフォルトは両方）',
+      },
+      limit: { type: 'string', description: '取得件数（デフォルト100、最大1000）' },
+    },
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = {};
+    if (args.types) flags.types = String(args.types);
+    if (args.limit) flags.limit = String(args.limit);
+    return runXangiCmd(['slack_channels', ...flagsToArgs(flags)]);
+  },
+};
+
+const slackSearchHandler: ToolHandler = {
+  name: 'slack_search',
+  description: 'Slackチャンネル内のメッセージを検索する（最新メッセージから）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      channel: { type: 'string', description: 'SlackチャンネルID（省略時は現在のチャンネル）' },
+      keyword: { type: 'string', description: '検索キーワード' },
+      count: { type: 'string', description: '検索対象件数（デフォルト15、最大100）' },
+    },
+    required: ['keyword'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = { keyword: String(args.keyword) };
+    if (args.channel) flags.channel = String(args.channel);
+    if (args.count) flags.count = String(args.count);
+    const env = context.channelId ? { XANGI_CHANNEL_ID: context.channelId } : undefined;
+    return runXangiCmd(['slack_search', ...flagsToArgs(flags)], env);
+  },
+};
+
+const slackEditHandler: ToolHandler = {
+  name: 'slack_edit',
+  description: 'Slack上の自分のメッセージを編集する。SlackのメッセージIDはtsを使う。',
+  parameters: {
+    type: 'object',
+    properties: {
+      channel: { type: 'string', description: 'SlackチャンネルID（省略時は現在のチャンネル）' },
+      'message-ts': { type: 'string', description: 'Slackメッセージts' },
+      content: { type: 'string', description: '新しいメッセージ内容' },
+    },
+    required: ['message-ts', 'content'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = {
+      'message-ts': String(args['message-ts']),
+      content: String(args.content),
+    };
+    if (args.channel) flags.channel = String(args.channel);
+    const env = context.channelId ? { XANGI_CHANNEL_ID: context.channelId } : undefined;
+    return runXangiCmd(['slack_edit', ...flagsToArgs(flags)], env);
+  },
+};
+
+const slackDeleteHandler: ToolHandler = {
+  name: 'slack_delete',
+  description: 'Slack上の自分のメッセージを削除する。SlackのメッセージIDはtsを使う。',
+  parameters: {
+    type: 'object',
+    properties: {
+      channel: { type: 'string', description: 'SlackチャンネルID（省略時は現在のチャンネル）' },
+      'message-ts': { type: 'string', description: 'Slackメッセージts' },
+    },
+    required: ['message-ts'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const flags: Record<string, string> = {
+      'message-ts': String(args['message-ts']),
+    };
+    if (args.channel) flags.channel = String(args.channel);
+    const env = context.channelId ? { XANGI_CHANNEL_ID: context.channelId } : undefined;
+    return runXangiCmd(['slack_delete', ...flagsToArgs(flags)], env);
+  },
+};
+
 // ─── Export ─────────────────────────────────────────────────────────
 
 /** Discord接続時に追加するツール */
 export function getDiscordTools(): ToolHandler[] {
   return [
     discordHistoryHandler,
+    discordMessageHandler,
     discordSendHandler,
     discordChannelsHandler,
     discordSearchHandler,
     discordEditHandler,
     discordDeleteHandler,
+    discordThreadLeaveHandler,
     mediaSendHandler,
   ];
 }
@@ -392,17 +670,40 @@ export function getWebTools(): ToolHandler[] {
 
 /** Slack接続時に追加するツール */
 export function getSlackTools(): ToolHandler[] {
-  return [slackHistoryHandler];
+  return [
+    slackHistoryHandler,
+    slackSendHandler,
+    slackChannelsHandler,
+    slackSearchHandler,
+    slackEditHandler,
+    slackDeleteHandler,
+  ];
 }
 
 /** スケジュール関連ツール */
-export function getScheduleTools(): ToolHandler[] {
-  return [scheduleListHandler, scheduleAddHandler, scheduleRemoveHandler, scheduleToggleHandler];
+export function getScheduleTools(platform?: ChatPlatform): ToolHandler[] {
+  return [
+    scheduleListHandler,
+    createScheduleAddHandler(platform),
+    scheduleUpdateHandler,
+    scheduleRemoveHandler,
+    scheduleToggleHandler,
+  ];
 }
 
 /** システム関連ツール */
-export function getSystemTools(): ToolHandler[] {
-  return [systemRestartHandler, systemSettingsHandler];
+export function getSystemTools(platform?: ChatPlatform): ToolHandler[] {
+  return [
+    webStatusHandler,
+    systemRestartHandler,
+    systemSettingsHandler,
+    createRuntimeSettingsHandler(platform),
+  ];
+}
+
+/** Extension lifecycle関連ツール */
+export function getExtensionTools(): ToolHandler[] {
+  return [extensionUninstallHandler];
 }
 
 /** 履歴取得ツール (web_history / slack_history)。プラットフォームに応じてランナーが呼ぶ */
@@ -412,12 +713,23 @@ export function getHistoryTools(): ToolHandler[] {
 
 /** 全xangiツール（プラットフォーム問わず） */
 export function getAllXangiTools(): ToolHandler[] {
-  return [...getDiscordTools(), ...getScheduleTools(), ...getSystemTools(), ...getHistoryTools()];
+  return [
+    ...getDiscordTools(),
+    ...getSlackTools(),
+    webHistoryHandler,
+    ...getScheduleTools(),
+    ...getSystemTools(),
+    ...getExtensionTools(),
+  ];
 }
 
 /** 実行プラットフォームに応じたxangiツール */
 export function getXangiTools(platform?: ChatPlatform): ToolHandler[] {
-  const commonTools = [...getScheduleTools(), ...getSystemTools()];
+  const commonTools = [
+    ...getScheduleTools(platform),
+    ...getSystemTools(platform),
+    ...getExtensionTools(),
+  ];
 
   if (platform === 'web') {
     return [...getWebTools(), ...commonTools];
@@ -431,7 +743,7 @@ export function getXangiTools(platform?: ChatPlatform): ToolHandler[] {
     return [...getSlackTools(), ...commonTools];
   }
 
-  if (platform === 'line') {
+  if (platform === 'line' || platform === 'telegram') {
     return commonTools;
   }
 

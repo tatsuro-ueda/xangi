@@ -1,11 +1,14 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, type Server } from 'http';
 import { spawn } from 'child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const XANGI = join(__dirname, '..', 'bin', 'xangi');
 const XANGI_CMD = join(__dirname, '..', 'bin', 'xangi-cmd');
 
 /**
@@ -38,13 +41,15 @@ function setMockResponse(res: MockResponse): void {
 
 function runCli(
   args: string[],
-  env: Record<string, string> = {}
+  env: Record<string, string> = {},
+  binary = XANGI_CMD
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
     // env に明示的に空文字を渡すと「未設定」扱いにしたいので、空文字キーは削る
     const baseEnv: Record<string, string> = { ...process.env } as Record<string, string>;
     delete baseEnv.XANGI_CHANNEL_ID;
     delete baseEnv.XANGI_DEFAULT_CHANNEL;
+    delete baseEnv.XANGI_PLATFORM;
     const finalEnv: Record<string, string> = {
       ...baseEnv,
       XANGI_TOOL_SERVER: mockUrl,
@@ -56,7 +61,7 @@ function runCli(
         finalEnv[k] = v;
       }
     }
-    const proc = spawn(XANGI_CMD, args, { env: finalEnv });
+    const proc = spawn(binary, args, { env: finalEnv });
     let stdout = '';
     let stderr = '';
     proc.stdout.on('data', (d) => {
@@ -168,6 +173,91 @@ describe('xangi-cmd CLI error handling', () => {
   });
 });
 
+describe('xangi tool canonical CLI and compatibility shim', () => {
+  it('routes canonical xangi tool through the same dispatcher', async () => {
+    setMockResponse({
+      status: 200,
+      body: JSON.stringify({ ok: true, result: 'canonical result' }),
+    });
+
+    const { stdout, code } = await runCli(
+      ['tool', 'discord_history', '--channel', 'canonical-channel'],
+      {},
+      XANGI
+    );
+
+    expect(code).toBe(0);
+    expect(stdout).toContain('canonical result');
+    expect(lastRequest).toEqual({
+      command: 'discord_history',
+      flags: { channel: 'canonical-channel' },
+      context: {},
+    });
+  });
+
+  it('keeps xangi-cmd as an output-compatible shim', async () => {
+    setMockResponse({
+      status: 200,
+      body: JSON.stringify({ ok: true, result: 'same result' }),
+    });
+
+    const canonical = await runCli(['tool', 'help', 'schedule_add'], {}, XANGI);
+    const legacy = await runCli(['help', 'schedule_add']);
+
+    expect(canonical).toEqual(legacy);
+  });
+
+  it('fails closed instead of guessing an instance without XANGI_TOOL_SERVER', async () => {
+    const { stderr, code } = await runCli(
+      ['tool', 'schedule_list'],
+      { XANGI_TOOL_SERVER: '' },
+      XANGI
+    );
+
+    expect(code).not.toBe(0);
+    expect(stderr).toContain('XANGI_TOOL_SERVER is not set');
+    expect(stderr).toContain('target instance is never guessed');
+  });
+
+  it('blocks system_restart locally when the new build cannot validate persisted state', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'xangi-tool-restart-state-'));
+    const dataDir = join(workspace, '.xangi');
+    writeFileSync(join(workspace, '.env'), 'WEB_CHAT_ENABLED=true\n');
+    mkdirSync(dataDir);
+    writeFileSync(
+      join(dataDir, 'web-projects.json'),
+      JSON.stringify({
+        version: 1,
+        projects: [
+          {
+            id: 'legacy',
+            name: 'Legacy',
+            prompt: '',
+            backend: 'removed-backend',
+            createdAt: '2026-08-12T00:00:00.000Z',
+            updatedAt: '2026-08-12T00:00:00.000Z',
+          },
+        ],
+      })
+    );
+    try {
+      const { stderr, code } = await runCli(
+        ['tool', 'system_restart'],
+        {
+          WEB_CHAT_ENABLED: 'true',
+          WORKSPACE_PATH: workspace,
+          DATA_DIR: dataDir,
+        },
+        XANGI
+      );
+      expect(code).not.toBe(0);
+      expect(stderr).toContain('再起動前のstate検証に失敗しました');
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
 /**
  * PR #193 のリグレッションテスト。
  *
@@ -215,5 +305,35 @@ describe('xangi-cmd CLI channelId completion', () => {
       XANGI_DEFAULT_CHANNEL: '',
     });
     expect(lastRequest.context).toEqual({});
+  });
+
+  it('uses the same models command name in the CLI and tool server', async () => {
+    await runCli(['models', '--backend', 'codex']);
+    expect(lastRequest.command).toBe('models');
+    expect(lastRequest.flags).toEqual({ backend: 'codex' });
+  });
+
+  it('forwards positional help topic to the tool server', async () => {
+    await runCli(['help', 'schedule_add']);
+    expect(lastRequest.command).toBe('help');
+    expect(lastRequest.flags).toEqual({ topic: 'schedule_add' });
+  });
+
+  it('passes next-turn model selection and current channel context', async () => {
+    await runCli(['models', '--backend', 'codex', '--use', 'gpt-test', '--effort', 'high'], {
+      XANGI_CHANNEL_ID: 'web-chat:test',
+    });
+    expect(lastRequest.command).toBe('models');
+    expect(lastRequest.flags).toEqual({ backend: 'codex', use: 'gpt-test', effort: 'high' });
+    expect(lastRequest.context).toEqual({ channelId: 'web-chat:test' });
+  });
+
+  it('passes runtime settings with channel and platform context', async () => {
+    await runCli(
+      ['runtime_settings', '--name', 'autoreply', '--action', 'set', '--value', 'on'],
+      { XANGI_CHANNEL_ID: 'C123', XANGI_PLATFORM: 'slack' }
+    );
+    expect(lastRequest.command).toBe('runtime_settings');
+    expect(lastRequest.context).toEqual({ channelId: 'C123', platform: 'slack' });
   });
 });

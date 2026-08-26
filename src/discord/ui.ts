@@ -1,5 +1,6 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Message } from 'discord.js';
 import type { AgentRunner } from '../agent-runner.js';
+import type { TurnHistoryEntry } from '../activity-store.js';
 import { TIMEOUT_EXTEND_ENABLED } from '../constants.js';
 
 /** 残り時間を mm:ss でフォーマット */
@@ -52,7 +53,39 @@ export function createProcessingButtons(timeout?: {
  */
 export type DiscordProcessingEntry = { message: Message; intervalId?: NodeJS.Timeout };
 export const discordProcessingMessages = new Map<string, DiscordProcessingEntry>();
-export const discordToolHistoryByMessageId = new Map<string, string[]>();
+export const discordToolHistoryByMessageId = new Map<string, TurnHistoryEntry[]>();
+export const discordReplySuggestionsByMessageId = new Map<string, string[]>();
+
+export type DiscordHistoryContext = { threadId: string; turnId: string };
+
+const DISCORD_HISTORY_CUSTOM_ID = 'xangi_tools';
+
+export function createDiscordHistoryCustomId(context?: DiscordHistoryContext): string {
+  if (!context) return DISCORD_HISTORY_CUSTOM_ID;
+  return `${DISCORD_HISTORY_CUSTOM_ID}|${context.threadId}|${context.turnId}`;
+}
+
+export function parseDiscordHistoryCustomId(customId: string): DiscordHistoryContext | undefined {
+  const [prefix, threadId, turnId] = customId.split('|');
+  if (prefix !== DISCORD_HISTORY_CUSTOM_ID || !threadId || !turnId) return undefined;
+  return { threadId, turnId };
+}
+
+export function createReplySuggestionButtons(
+  sourceMessageId: string,
+  count: number
+): ActionRowBuilder<ButtonBuilder> {
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  for (let index = 0; index < Math.min(count, 5); index++) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`xangi_reply_suggestion_${sourceMessageId}_${index}`)
+        .setLabel(String(index + 1))
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  return row;
+}
 
 /** チャンネルの現在のタイムアウト状態から Discord UI 用に整形 */
 export function getDiscordTimeoutInfoFor(
@@ -71,15 +104,36 @@ export function getDiscordTimeoutInfoFor(
 /** 完了後に表示するボタン群 */
 export function createCompletedButtons(options?: {
   showTools?: boolean;
+  historyContext?: DiscordHistoryContext;
+  showLeave?: boolean;
+  showReplySuggestions?: boolean;
 }): ActionRowBuilder<ButtonBuilder> {
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId('xangi_new').setLabel('New').setStyle(ButtonStyle.Secondary)
-  );
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  if (options?.showLeave) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('xangi_thread_leave')
+        .setLabel('Close')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  } else {
+    row.addComponents(
+      new ButtonBuilder().setCustomId('xangi_new').setLabel('New').setStyle(ButtonStyle.Secondary)
+    );
+  }
   if (options?.showTools) {
     row.addComponents(
       new ButtonBuilder()
-        .setCustomId('xangi_tools')
-        .setLabel('Tools')
+        .setCustomId(createDiscordHistoryCustomId(options.historyContext))
+        .setLabel('History')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (options?.showReplySuggestions) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('xangi_reply_suggestions')
+        .setLabel('返信候補')
         .setStyle(ButtonStyle.Secondary)
     );
   }

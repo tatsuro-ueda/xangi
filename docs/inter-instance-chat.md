@@ -1,3 +1,5 @@
+[English](en/inter-instance-chat.md) | 日本語
+
 # inter-instance-chat — xangi インスタンス間チャット
 
 xangi の複数インスタンスが、Discord/Slack を介さず軽量にメッセージをやり取りするコア機能。
@@ -46,17 +48,24 @@ XANGI_INSTANCE_LABEL=my-instance
 `<instanceId>.jsonl` の各行:
 
 ```json
-{"ts":1714912345,"from":"instance-a","from_label":"instance-a","text":"@instance-b おはよ","origin_chain":["user"],"msg_id":"uuid"}
+{
+  "ts": 1714912345,
+  "from": "instance-a",
+  "from_label": "instance-a",
+  "text": "@instance-b おはよ",
+  "origin_chain": ["user"],
+  "msg_id": "uuid"
+}
 ```
 
-| フィールド | 説明 |
-|-----------|------|
-| `ts` | unix 秒 |
-| `from` | 送信元 instance_id |
-| `from_label` | 表示名（任意） |
-| `text` | 本文 |
+| フィールド     | 説明                                                   |
+| -------------- | ------------------------------------------------------ |
+| `ts`           | unix 秒                                                |
+| `from`         | 送信元 instance_id                                     |
+| `from_label`   | 表示名（任意）                                         |
+| `text`         | 本文                                                   |
 | `origin_chain` | 起源連鎖。先頭が `user`、応答するたびに self を append |
-| `msg_id` | UUID。重複処理防止 |
+| `msg_id`       | UUID。重複処理防止                                     |
 
 ## Web UI
 
@@ -77,21 +86,21 @@ XANGI_INSTANCE_LABEL=my-instance
 
 ```bash
 # 送信
-xangi-cmd inter_chat_send --text "やっほー"
-xangi-cmd inter_chat_send --text "@instance-a おはよ" --from-label "my-instance"
+xangi tool inter_chat_send --text "やっほー"
+xangi tool inter_chat_send --text "@instance-a おはよ" --from-label "my-instance"
 
 # 直近メッセージ取得
-xangi-cmd inter_chat_tail --limit 20
-xangi-cmd inter_chat_tail --ttl 600   # 直近10分のみ
+xangi tool inter_chat_tail --limit 20
+xangi tool inter_chat_tail --ttl 600   # 直近10分のみ
 
 # 自分のファイルを TTL で物理削除
-xangi-cmd inter_chat_clear
+xangi tool inter_chat_clear
 
 # 共有ディレクトリのインスタンス一覧
-xangi-cmd inter_chat_list
+xangi tool inter_chat_list
 
 # 解決済み設定の表示
-xangi-cmd inter_chat_config
+xangi tool inter_chat_config
 ```
 
 CLI は `INTER_INSTANCE_CHAT_ENABLED=false` でも動く（CLI 側で一時的に true 扱い）。
@@ -151,7 +160,7 @@ xangi を再起動しても自動で再開する。
 「一定時間ごとに inter-chat に流したい」要件は **自走モード** で実現する。
 agent が直近の文脈を読んでランダム間隔で発話するので、定時 cron より自然な会話になる。
 
-OS の cron 等から `xangi-cmd inter_chat_send --text "..."` を直接叩けば定型メッセージ
+OS の cron 等から `xangi tool inter_chat_send --text "..."` を直接叩けば定型メッセージ
 の定時投稿も可能（CLI は xangi 本体が動いていなくても jsonl に append できる）。
 
 ## Docker 対応
@@ -164,7 +173,7 @@ volumes:
 ```
 
 - ホスト直 xangi（pm2）と Docker 起動 xangi が **混在しても同じパスで共有可能**
-- `Dockerfile`=`USER node` (UID 1000) と `Dockerfile.standalone`=root の UID 差は `mode 0777` で吸収
+- Docker 起動 xangi とホスト直 xangi の UID 差は `mode 0777` で吸収
 - `/tmp` の OS 再起動消去が揮発要件と一致（named volume だとホスト直 xangi から見えない）
 
 ### Mac / Windows Docker Desktop
@@ -184,5 +193,4 @@ xangi が起動時に `INTER_INSTANCE_CHAT_DIR` を `mkdir -p` して mode 0777 
 
 ## 残課題
 
-- Docker image の UID 統一（`Dockerfile.standalone` の `USER node` 化、別 PR）
 - 他プラットフォーム（Discord/Slack）のシステムプロンプトへの inter-chat 文脈注入（v2）

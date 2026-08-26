@@ -3,31 +3,38 @@ import {
   ChatInputCommandInteraction,
   AutocompleteInteraction,
   Interaction,
+  MessageFlags,
 } from 'discord.js';
+import type { ButtonInteraction } from 'discord.js';
 import {
-  ALL_AGENT_BACKENDS,
   type Config,
   type AgentBackend,
   type EffortLevel,
   type DiscordCompletionNotifyMode,
 } from '../config.js';
-import { getBackendDisplayName, type AgentRunner } from '../agent-runner.js';
+import {
+  LOCAL_LLM_REASONING_EFFORTS,
+  type LocalLlmReasoningEffort,
+} from '../local-llm/reasoning-effort.js';
+import { getBackendDisplayName, type AgentRunner, type RunResult } from '../agent-runner.js';
+import { getSupportedEffortLevels } from '../backend-effort.js';
 import type { BackendResolver } from '../backend-resolver.js';
 import type { DynamicRunnerManager } from '../dynamic-runner.js';
 import { ClaudeCodeRunner } from '../claude-code.js';
 import { formatAgentErrorForUser } from '../errors.js';
 import { processManager } from '../process-manager.js';
-import { resolveApproval } from '../approval.js';
+import { requestProcessRestart } from '../restart-process.js';
 import { loadSkills, formatSkillList, type Skill } from '../skills.js';
+import { loadReplySuggestionsEnabled, loadSettings, formatSettings } from '../settings.js';
+import { canSelfRestart, getSelfLifecyclePermission } from '../self-lifecycle.js';
 import {
-  getChannelCompletionNotifyMode,
-  loadSettings,
-  formatSettings,
-  saveSettings,
-} from '../settings.js';
-import { updateEnvKeyValue } from '../env-persist.js';
-import { getSession, setSession, deleteSession, ensureSession } from '../sessions.js';
-import { splitMessage } from '../message-split.js';
+  getSession,
+  setSession,
+  closeActiveSession,
+  getActiveSessionId,
+  getSessionEntry,
+} from '../sessions.js';
+import { splitDiscordMessage } from '../message-split.js';
 import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH } from '../constants.js';
 import { buildAttachmentResult } from '../file-utils.js';
 import {
@@ -38,32 +45,67 @@ import {
   type Platform,
   type ScheduleType,
 } from '../scheduler.js';
-import { discordToolHistoryByMessageId } from './ui.js';
+import {
+  createCompletedButtons,
+  createProcessingButtons,
+  createReplySuggestionButtons,
+  discordProcessingMessages,
+  discordReplySuggestionsByMessageId,
+  discordToolHistoryByMessageId,
+  getDiscordTimeoutInfoFor,
+  parseDiscordHistoryCustomId,
+} from './ui.js';
+import {
+  addToolHistory,
+  appendToolHistory,
+  formatTurnHistoryDisclosure,
+  withoutFinalResponse,
+} from '../tool-history.js';
+import { getTurnHistory, readTurnHistory, type TurnHistoryEntry } from '../activity-store.js';
 import { waitBeforeFollowupDiscordSend } from './send-delay.js';
+import { resolveDiscordSettingsChannelId } from './thread-context.js';
+import {
+  appendReplySuggestionInstruction,
+  fallbackReplySuggestions,
+  formatNumberedSuggestions,
+  sanitizeReplySuggestionOutput,
+  stripReplySuggestionMarkup,
+} from '../reply-suggestions.js';
+import { executeModelsCommand } from '../models-command.js';
+import { discoverBackendModels, type BackendModelDiscovery } from '../backend-models.js';
+import { StreamSession } from '../stream-session.js';
+import { runWithBubbleEvents } from '../bubble-events-runner.js';
+import { threadIdFor, turnIdFor } from '../events-emitter.js';
+import { executeRuntimeSettingsCommand } from '../runtime-settings-command.js';
+import type { WorkspaceRegistry } from '../workspace-registry.js';
+import { ensureSessionWithWorkspace } from '../session-workspace.js';
 
-/** スキル一覧を保持する可変参照。`/skills` での再読込を呼び出し元と共有する */
+/** スキル一覧を保持する可変参照。`/skill` での再読込を呼び出し元と共有する */
 export interface SkillsRef {
   current: Skill[];
 }
 
-const DISCORD_APPLICATION_COMMAND_LIMIT = 100;
+type DiscordHistoryInteraction = Pick<ButtonInteraction, 'deferReply' | 'editReply' | 'followUp'>;
 
-const BACKEND_CHOICE_LABELS: Record<AgentBackend, string> = {
-  'claude-code': 'Claude Code',
-  codex: 'Codex',
-  cursor: 'Cursor',
-  grok: 'Grok',
-  antigravity: 'Antigravity',
-  'local-llm': 'Local LLM',
-};
-
-function getBackendChoices(config: Config): { name: string; value: AgentBackend }[] {
-  const allowedBackends = config.agent?.allowedBackends ?? [...ALL_AGENT_BACKENDS];
-  return allowedBackends.map((backend) => ({
-    name: BACKEND_CHOICE_LABELS[backend],
-    value: backend,
-  }));
+export async function respondWithDiscordTurnHistory(
+  interaction: DiscordHistoryInteraction,
+  loadHistory: () => TurnHistoryEntry[]
+): Promise<void> {
+  // Discord requires an initial interaction acknowledgement within about 3 seconds.
+  // Acknowledge before formatting or reading persisted history.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const chunks = splitDiscordMessage(
+    formatTurnHistoryDisclosure(loadHistory()),
+    DISCORD_SAFE_LENGTH
+  );
+  await interaction.editReply({ content: chunks[0] || '履歴はありません' });
+  for (let i = 1; i < chunks.length; i++) {
+    await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
+  }
 }
+
+const DISCORD_APPLICATION_COMMAND_LIMIT = 100;
+const DISCORD_MODEL_DISCOVERY_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /** スキル名を Discord コマンド名に変換（小文字英数字とハイフンのみ、最大32文字） */
 function skillCommandName(skillName: string): string {
@@ -78,7 +120,7 @@ function skillCommandName(skillName: string): string {
 /** スケジュール一覧をDiscord向けに分割する */
 function splitScheduleContent(content: string, maxLength: number): string[] {
   const sep = '\n' + SCHEDULE_SEPARATOR + '\n';
-  const chunks = splitMessage(content, maxLength, sep);
+  const chunks = splitDiscordMessage(content, maxLength, sep);
   return chunks.map((c) => c.replaceAll(SCHEDULE_SEPARATOR, ''));
 }
 
@@ -107,23 +149,69 @@ export function buildSlashCommands(
   config: Config,
   skills: Skill[]
 ): ReturnType<SlashCommandBuilder['toJSON']>[] {
-  const backendChoices = getBackendChoices(config);
   const commands: ReturnType<SlashCommandBuilder['toJSON']>[] = [
     new SlashCommandBuilder().setName('new').setDescription('新しいセッションを開始する').toJSON(),
+    new SlashCommandBuilder()
+      .setName('workspace')
+      .setDescription('このチャンネルのワークスペースを設定する')
+      .addSubcommand((sub) => sub.setName('show').setDescription('現在の設定を表示する'))
+      .addSubcommand((sub) => sub.setName('list').setDescription('登録済み一覧を表示する'))
+      .addSubcommand((sub) =>
+        sub
+          .setName('use')
+          .setDescription('登録済みworkspaceへ切り替える')
+          .addStringOption((opt) =>
+            opt.setName('name').setDescription('登録済み表示名').setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName('set')
+          .setDescription('任意の絶対パスを登録して設定する')
+          .addStringOption((opt) => opt.setName('name').setDescription('表示名').setRequired(true))
+          .addStringOption((opt) =>
+            opt.setName('path').setDescription('既存directoryの絶対パス').setRequired(true)
+          )
+      )
+      .addSubcommand((sub) => sub.setName('reset').setDescription('defaultへ戻す'))
+      .toJSON(),
     new SlashCommandBuilder().setName('stop').setDescription('実行中のタスクを停止する').toJSON(),
     new SlashCommandBuilder()
-      .setName('skills')
-      .setDescription('利用可能なスキル一覧を表示')
-      .toJSON(),
-    new SlashCommandBuilder()
       .setName('skill')
-      .setDescription('スキルを実行する')
+      .setDescription('利用可能なスキルを表示・実行する')
       .addStringOption((option) =>
-        option.setName('name').setDescription('スキル名').setRequired(true).setAutocomplete(true)
+        option.setName('name').setDescription('スキル名').setRequired(false).setAutocomplete(true)
       )
       .addStringOption((option) => option.setName('args').setDescription('引数').setRequired(false))
       .toJSON(),
     new SlashCommandBuilder().setName('settings').setDescription('現在の設定を表示する').toJSON(),
+    new SlashCommandBuilder()
+      .setName('models')
+      .setDescription('利用可能なモデル一覧を表示する')
+      .addStringOption((option) =>
+        option
+          .setName('backend')
+          .setDescription('バックエンド（省略時はすべて）')
+          .setRequired(false)
+          .setAutocomplete(true)
+      )
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('replysuggestions')
+      .setDescription('回答候補の全体ON/OFFを設定する')
+      .addStringOption((option) =>
+        option
+          .setName('mode')
+          .setDescription('回答候補モード')
+          .setRequired(true)
+          .addChoices(
+            { name: 'show (現在の設定を表示)', value: 'show' },
+            { name: 'on (全プラットフォームで生成)', value: 'on' },
+            { name: 'off (生成せずトークンを使わない)', value: 'off' },
+            { name: 'default (起動時設定に戻す)', value: 'default' }
+          )
+      )
+      .toJSON(),
     new SlashCommandBuilder()
       .setName('notify')
       .setDescription('このチャンネルの完了通知を設定する')
@@ -194,26 +282,19 @@ export function buildSlashCommands(
               .setName('type')
               .setDescription('バックエンド名')
               .setRequired(true)
-              .addChoices(...backendChoices)
+              .setAutocomplete(true)
           )
-          .addStringOption((opt) => opt.setName('model').setDescription('モデル名'))
+          .addStringOption((opt) =>
+            opt.setName('model').setDescription('モデル名').setAutocomplete(true)
+          )
           .addStringOption((opt) =>
             opt
               .setName('effort')
-              .setDescription('effortレベル（Claude Code用）')
-              .addChoices(
-                { name: 'デフォルト', value: 'none' },
-                { name: 'low', value: 'low' },
-                { name: 'medium', value: 'medium' },
-                { name: 'high', value: 'high' },
-                { name: 'max', value: 'max' }
-              )
+              .setDescription('effortレベル（対応バックエンド用）')
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) => sub.setName('reset').setDescription('デフォルトに戻す'))
-      .addSubcommand((sub) =>
-        sub.setName('list').setDescription('利用可能なバックエンド一覧を表示')
-      )
       .toJSON(),
   ];
 
@@ -222,7 +303,19 @@ export function buildSlashCommands(
     commands.push(
       new SlashCommandBuilder()
         .setName('autoreply')
-        .setDescription('このチャンネルのメンションなし応答を切り替え')
+        .setDescription('このチャンネルのメンションなし応答を設定')
+        .addStringOption((option) =>
+          option
+            .setName('mode')
+            .setDescription('メンションなし応答モード')
+            .setRequired(true)
+            .addChoices(
+              { name: 'show (現在の設定を表示)', value: 'show' },
+              { name: 'on (メンションなしで応答)', value: 'on' },
+              { name: 'off (メンションなし応答を無効)', value: 'off' },
+              { name: 'default (チャンネル設定を削除)', value: 'default' }
+            )
+        )
         .toJSON()
     );
   }
@@ -239,14 +332,34 @@ export function buildSlashCommands(
     );
   }
 
+  // ALLOW_THREAD_MODE_COMMAND=true の場合のみコマンドを登録
+  if (config.discord.allowThreadModeCommand) {
+    commands.push(
+      new SlashCommandBuilder()
+        .setName('threadmode')
+        .setDescription('Discord の発言ごとスレッド返信モードを切替')
+        .addStringOption((option) =>
+          option
+            .setName('mode')
+            .setDescription('スレッドモード')
+            .setRequired(true)
+            .addChoices(
+              { name: 'show (現在の設定を表示)', value: 'show' },
+              { name: 'on (発言ごとにスレッド返信)', value: 'on' },
+              { name: 'off (チャンネル直下に返信)', value: 'off' },
+              { name: 'default (チャンネル設定を削除)', value: 'default' }
+            )
+        )
+        .toJSON()
+    );
+  }
+
   // ALLOW_LLM_MODE_COMMAND=true の場合のみコマンドを登録（Local LLM 動作モード切替）
   if (config.discord.allowLlmModeCommand) {
     commands.push(
       new SlashCommandBuilder()
         .setName('llmmode')
-        .setDescription(
-          'このチャンネルの Local LLM 動作モードを切替 (agent/lite/chat/default/show)'
-        )
+        .setDescription('このチャンネルの Local LLM 動作モードを切替 (agent/chat/default/show)')
         .addStringOption((option) =>
           option
             .setName('mode')
@@ -254,10 +367,32 @@ export function buildSlashCommands(
             .setRequired(true)
             .addChoices(
               { name: 'agent (全機能ON、複雑タスク向け)', value: 'agent' },
-              { name: 'lite (skills OFF、軽量、Discord 操作向け)', value: 'lite' },
               { name: 'chat (全機能OFF、純粋会話)', value: 'chat' },
               { name: 'default (チャンネル override 削除、起動時値に戻す)', value: 'default' },
               { name: 'show (現在の設定を表示)', value: 'show' }
+            )
+        )
+        .toJSON()
+    );
+  }
+
+  if (config.discord.allowLlmEffortCommand) {
+    commands.push(
+      new SlashCommandBuilder()
+        .setName('llmeffort')
+        .setDescription('このチャンネルの Local LLM reasoning effort を切替')
+        .addStringOption((option) =>
+          option
+            .setName('level')
+            .setDescription('reasoning effort')
+            .setRequired(true)
+            .addChoices(
+              { name: 'show (現在の設定を表示)', value: 'show' },
+              { name: 'default (チャンネル設定を削除)', value: 'default' },
+              ...LOCAL_LLM_REASONING_EFFORTS.map((effort) => ({
+                name: effort,
+                value: effort,
+              }))
             )
         )
         .toJSON()
@@ -296,61 +431,357 @@ export function buildSlashCommands(
   return commands;
 }
 
+interface DiscordAutocompleteChoice {
+  name: string;
+  value: string;
+}
+
+interface DiscordAutocompleteInput {
+  commandName: string;
+  focusedName: string;
+  focusedValue: string;
+  backend?: AgentBackend;
+  model?: string;
+}
+
+interface DiscordModelDiscoveryCacheEntry {
+  result?: BackendModelDiscovery;
+  expiresAt: number;
+  refresh?: Promise<BackendModelDiscovery>;
+}
+
+/**
+ * Discord autocomplete must answer within a few seconds. Backend discovery can
+ * spawn an external CLI, so keep the last result and refresh stale entries in
+ * the background instead of blocking an interaction.
+ */
+export function createDiscordModelDiscoveryCache(
+  discoverModels: typeof discoverBackendModels,
+  ttlMs = DISCORD_MODEL_DISCOVERY_CACHE_TTL_MS
+): typeof discoverBackendModels {
+  const cache = new Map<AgentBackend, DiscordModelDiscoveryCacheEntry>();
+
+  const refresh = (
+    backend: AgentBackend,
+    entry: DiscordModelDiscoveryCacheEntry
+  ): Promise<BackendModelDiscovery> => {
+    if (entry.refresh) return entry.refresh;
+    entry.refresh = discoverModels(backend)
+      .then((result) => {
+        entry.result = result;
+        entry.expiresAt = Date.now() + ttlMs;
+        entry.refresh = undefined;
+        return result;
+      })
+      .catch((error) => {
+        entry.refresh = undefined;
+        if (entry.result) return entry.result;
+        cache.delete(backend);
+        throw error;
+      });
+    return entry.refresh;
+  };
+
+  return async (backend: AgentBackend) => {
+    let entry = cache.get(backend);
+    if (!entry) {
+      entry = { expiresAt: 0 };
+      cache.set(backend, entry);
+      return refresh(backend, entry);
+    }
+    if (entry.result && entry.expiresAt > Date.now()) return entry.result;
+    if (entry.result) {
+      void refresh(backend, entry);
+      return entry.result;
+    }
+    return refresh(backend, entry);
+  };
+}
+
+function filterAutocompleteChoices(
+  choices: DiscordAutocompleteChoice[],
+  query: string
+): DiscordAutocompleteChoice[] {
+  const normalized = query.toLowerCase();
+  return choices
+    .filter(
+      (choice) =>
+        !normalized ||
+        choice.name.toLowerCase().includes(normalized) ||
+        choice.value.toLowerCase().includes(normalized)
+    )
+    .slice(0, 25);
+}
+
+export async function getDiscordAutocompleteChoices(
+  input: DiscordAutocompleteInput,
+  skills: Skill[],
+  resolver: BackendResolver,
+  discoverModels: typeof discoverBackendModels = discoverBackendModels
+): Promise<DiscordAutocompleteChoice[]> {
+  if (input.commandName === 'skill' && input.focusedName === 'name') {
+    return filterAutocompleteChoices(
+      skills.map((skill) => ({
+        name: `${skill.name} - ${skill.description.slice(0, 50)}`.slice(0, 100),
+        value: skill.name,
+      })),
+      input.focusedValue
+    );
+  }
+
+  if (
+    (input.commandName === 'backend' && input.focusedName === 'type') ||
+    (input.commandName === 'models' && input.focusedName === 'backend')
+  ) {
+    return filterAutocompleteChoices(
+      resolver.getSelectableBackends().map((backend) => ({
+        name: getBackendDisplayName(backend),
+        value: backend,
+      })),
+      input.focusedValue
+    );
+  }
+
+  if (input.commandName !== 'backend' || !input.backend) return [];
+  if (!resolver.isBackendSelectable(input.backend)) return [];
+
+  if (input.focusedName === 'model') {
+    const discovery = await discoverModels(input.backend);
+    if (discovery.status !== 'available') return [];
+    const allowedModels = resolver.getAllowedModels();
+    return filterAutocompleteChoices(
+      discovery.models
+        .filter((model) => !allowedModels || allowedModels.includes(model.id))
+        .map((model) => ({
+          name:
+            model.displayName && model.displayName !== model.id
+              ? `${model.displayName} (${model.id})`.slice(0, 100)
+              : model.id.slice(0, 100),
+          value: model.id,
+        })),
+      input.focusedValue
+    );
+  }
+
+  if (input.focusedName === 'effort') {
+    let discovery: BackendModelDiscovery | undefined;
+    if (input.model) discovery = await discoverModels(input.backend);
+    const selectedModel = discovery?.models.find((model) => model.id === input.model);
+    const efforts = getSupportedEffortLevels(input.backend).filter(
+      (effort) =>
+        !selectedModel?.supportedEfforts?.length || selectedModel.supportedEfforts.includes(effort)
+    );
+    return filterAutocompleteChoices(
+      [
+        { name: 'デフォルト', value: 'none' },
+        ...efforts.map((effort) => ({ name: effort, value: effort })),
+      ],
+      input.focusedValue
+    );
+  }
+
+  return [];
+}
+
 async function handleAutocomplete(
   interaction: AutocompleteInteraction,
-  skills: Skill[]
+  skills: Skill[],
+  resolver: BackendResolver,
+  discoverModels: typeof discoverBackendModels
 ): Promise<void> {
-  const focusedValue = interaction.options.getFocused().toLowerCase();
-
-  const filtered = skills
-    .filter(
-      (skill) =>
-        skill.name.toLowerCase().includes(focusedValue) ||
-        skill.description.toLowerCase().includes(focusedValue)
-    )
-    .slice(0, 25) // Discord制限: 最大25件
-    .map((skill) => ({
-      name: `${skill.name} - ${skill.description.slice(0, 50)}`,
-      value: skill.name,
-    }));
-
-  await interaction.respond(filtered);
+  const focused = interaction.options.getFocused(true);
+  const backendOptionName = interaction.commandName === 'models' ? 'backend' : 'type';
+  const backend = interaction.options.getString(backendOptionName) as AgentBackend | null;
+  const model = interaction.options.getString('model') ?? undefined;
+  const choices = await getDiscordAutocompleteChoices(
+    {
+      commandName: interaction.commandName,
+      focusedName: focused.name,
+      focusedValue: String(focused.value),
+      backend: backend ?? undefined,
+      model,
+    },
+    skills,
+    resolver,
+    discoverModels
+  );
+  await interaction.respond(choices);
 }
 
 /** スキル実行プロンプトをエージェントに投げて結果を返信する（/skill と個別スキルコマンド共通） */
-async function handleSkillCommand(
+export async function handleSkillCommand(
   interaction: ChatInputCommandInteraction,
   agentRunner: AgentRunner,
   config: Config,
   channelId: string,
-  skillName: string
+  settingsChannelId: string,
+  skillName: string,
+  workspaceRegistry?: WorkspaceRegistry
 ) {
   const args = interaction.options.getString('args') || '';
   const skipPermissions = config.agent.config.skipPermissions ?? false;
+  const showButtons = config.discord.showButtons ?? true;
+  const useStreaming = config.discord.streaming ?? true;
+  const showThinking = config.discord.showThinking ?? true;
+  const toolHistoryMode =
+    config.discord.toolHistoryMode ?? ((config.discord.showToolUse ?? true) ? 'inline' : 'off');
+  const captureToolUse = toolHistoryMode !== 'off';
+  const showLiveToolUse = captureToolUse && (config.discord.showLiveToolUse ?? true);
+  const replySuggestionCount = config.discord.replySuggestionCount ?? 3;
+  const replySuggestionsEnabled =
+    showButtons && loadReplySuggestionsEnabled(config.discord.replySuggestions !== false);
 
   await interaction.deferReply();
 
   try {
-    const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
+    let prompt = `[プラットフォーム: Discord]\n[チャンネルID: ${channelId}]\nスキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
+    if (replySuggestionsEnabled) {
+      prompt = appendReplySuggestionInstruction(prompt, replySuggestionCount);
+    }
+
     const sessionId = getSession(channelId);
-    const appSessionId = ensureSession(channelId, { platform: 'discord' });
-    const { result, sessionId: newSessionId } = await agentRunner.run(prompt, {
-      skipPermissions,
-      sessionId,
-      channelId,
-      appSessionId,
+    const { appSessionId, workspace } = await ensureSessionWithWorkspace({
+      registry: workspaceRegistry,
+      platform: 'discord',
+      contextKey: channelId,
+      bindingKey: settingsChannelId,
+    });
+    const eventCtx = {
+      threadId: threadIdFor('discord', channelId),
+      turnId: turnIdFor('discord', interaction.id),
+      threadLabel: `Discord /skill ${skillName}`,
+      platform: 'discord' as const,
+      userText: `/skill ${skillName}${args ? ` ${args}` : ''}`,
+      eventTextSanitizer: stripReplySuggestionMarkup,
+    };
+    const toolHistory: string[] = [];
+
+    const initialMessage = await interaction.editReply({
+      content: '考え中... ⠋',
+      ...(showButtons && { components: [createProcessingButtons()] }),
+    });
+    if (showButtons) {
+      discordProcessingMessages.set(channelId, { message: initialMessage });
+    }
+
+    const streamSession = new StreamSession({
+      formatToolLine: showLiveToolUse
+        ? (toolName, toolInput) => {
+            const lines: string[] = [];
+            addToolHistory(lines, toolName, toolInput);
+            return lines[0] ?? null;
+          }
+        : undefined,
+      render: async (view) => {
+        const content =
+          view.phase === 'thinking'
+            ? `${view.toolLines.length > 0 ? `${view.toolLines.join('\n')}\n\n` : ''}${view.statusLine}`
+            : appendToolHistory(stripReplySuggestionMarkup(view.text), view.toolLines, ' ▌').slice(
+                0,
+                DISCORD_MAX_LENGTH
+              );
+        await interaction
+          .editReply({
+            content,
+            ...(showButtons && {
+              components: [
+                createProcessingButtons(getDiscordTimeoutInfoFor(agentRunner, channelId)),
+              ],
+            }),
+          })
+          .catch((error) => {
+            console.error('[xangi] Failed to edit /skill response:', error?.message || error);
+          });
+      },
     });
 
-    setSession(channelId, newSessionId);
-    const chunks = splitMessage(result, DISCORD_SAFE_LENGTH);
-    await interaction.editReply(chunks[0] || '✅');
+    const captureCallbacks = {
+      onToolUse: (toolName: string, toolInput: Record<string, unknown>) => {
+        if (captureToolUse) addToolHistory(toolHistory, toolName, toolInput);
+      },
+    };
+    streamSession.start();
+    let runResult: RunResult;
+    try {
+      const sessionCallbacks = streamSession.callbacks(captureCallbacks);
+      runResult = await runWithBubbleEvents(
+        agentRunner,
+        prompt,
+        eventCtx,
+        useStreaming && showThinking ? sessionCallbacks : { onToolUse: sessionCallbacks.onToolUse },
+        {
+          skipPermissions,
+          sessionId,
+          channelId,
+          settingsChannelId,
+          appSessionId,
+          workdir: workspace?.path,
+        }
+      );
+    } finally {
+      streamSession.finish();
+      discordProcessingMessages.delete(channelId);
+    }
+
+    setSession(channelId, runResult.sessionId);
+    const extracted = sanitizeReplySuggestionOutput(
+      runResult.result,
+      replySuggestionsEnabled,
+      replySuggestionCount
+    );
+    if (replySuggestionsEnabled && extracted.suggestions.length === 0) {
+      extracted.suggestions = fallbackReplySuggestions(replySuggestionCount);
+    }
+    const { filePaths, displayText } = buildAttachmentResult(
+      extracted.text,
+      runResult.attachments,
+      workspace?.path
+    );
+    const displayTextWithTools =
+      toolHistoryMode === 'inline' ? appendToolHistory(displayText, toolHistory) : displayText;
+    const chunks = splitDiscordMessage(displayTextWithTools, DISCORD_SAFE_LENGTH);
+    const turnHistory = withoutFinalResponse(
+      getTurnHistory(eventCtx.threadId, eventCtx.turnId),
+      runResult.result
+    );
+    const showHistory =
+      toolHistoryMode === 'button' &&
+      (config.discord.showToolButton ?? true) &&
+      turnHistory.length > 0;
+    const completedButtons = showButtons
+      ? createCompletedButtons({
+          showTools: showHistory,
+          historyContext: { threadId: eventCtx.threadId, turnId: eventCtx.turnId },
+          showLeave: interaction.channel?.isThread() ?? false,
+          showReplySuggestions: extracted.suggestions.length > 0,
+        })
+      : undefined;
+
+    let finalMessage = await interaction.editReply({
+      content: chunks[0] || '✅',
+      components: chunks.length === 1 && completedButtons ? [completedButtons] : [],
+    });
     for (let i = 1; i < chunks.length; i++) {
       await waitBeforeFollowupDiscordSend();
-      await interaction.followUp(chunks[i]);
+      finalMessage = await interaction.followUp({
+        content: chunks[i],
+        components: i === chunks.length - 1 && completedButtons ? [completedButtons] : [],
+      });
+    }
+
+    if (showHistory) {
+      discordToolHistoryByMessageId.set(finalMessage.id, turnHistory);
+    }
+    if (showButtons && extracted.suggestions.length > 0) {
+      discordReplySuggestionsByMessageId.set(finalMessage.id, extracted.suggestions);
+    }
+    if (filePaths.length > 0) {
+      await interaction.followUp({ files: filePaths.map((attachment) => ({ attachment })) });
     }
   } catch (error) {
     console.error('[xangi] Error:', error);
-    await interaction.editReply('エラーが発生しました');
+    discordProcessingMessages.delete(channelId);
+    await interaction.editReply({ content: formatAgentErrorForUser(error), components: [] });
   }
 }
 
@@ -454,6 +885,26 @@ export interface InteractionHandlerDeps {
   scheduler: Scheduler;
   workdir: string;
   skillsRef: SkillsRef;
+  workspaceRegistry: WorkspaceRegistry;
+  discoverModels?: typeof discoverBackendModels;
+  onReplySuggestion?: (interaction: ButtonInteraction, suggestion: string) => Promise<void>;
+}
+
+export async function removeUserFromDiscordThread(
+  channel: Interaction['channel'],
+  userId: string
+): Promise<boolean> {
+  if (!channel?.isThread()) return false;
+  await channel.members.remove(userId);
+  return true;
+}
+
+export function formatThreadLeaveError(error: unknown): string {
+  const code = (error as { code?: number } | null)?.code;
+  if (code === 50001 || code === 50013) {
+    return '❌ Botに「スレッドの管理」権限が必要です';
+  }
+  return '❌ スレッドから退出できませんでした';
 }
 
 /**
@@ -463,12 +914,34 @@ export interface InteractionHandlerDeps {
 export function createInteractionHandler(
   deps: InteractionHandlerDeps
 ): (interaction: Interaction) => Promise<void> {
-  const { config, resolver, agentRunner, scheduler, workdir, skillsRef } = deps;
+  const {
+    config,
+    resolver,
+    agentRunner,
+    scheduler,
+    workdir,
+    skillsRef,
+    workspaceRegistry,
+    discoverModels = discoverBackendModels,
+    onReplySuggestion,
+  } = deps;
+
+  const autocompleteDiscoverModels = createDiscordModelDiscoveryCache(discoverModels);
+  for (const backend of resolver.getSelectableBackends()) {
+    void autocompleteDiscoverModels(backend).catch((error) => {
+      console.warn(`[xangi] Failed to prewarm ${backend} model autocomplete:`, error);
+    });
+  }
 
   return async (interaction: Interaction) => {
     // オートコンプリート処理
     if (interaction.isAutocomplete()) {
-      await handleAutocomplete(interaction, skillsRef.current);
+      await handleAutocomplete(
+        interaction,
+        skillsRef.current,
+        resolver,
+        autocompleteDiscoverModels
+      );
       return;
     }
 
@@ -485,7 +958,8 @@ export function createInteractionHandler(
       }
 
       if (interaction.customId === 'xangi_stop') {
-        const stopped = processManager.stop(channelId) || agentRunner.cancel?.(channelId) || false;
+        const managedProcessStopped = await processManager.stopAndWait(channelId);
+        const stopped = managedProcessStopped || agentRunner.cancel?.(channelId) || false;
         await interaction.deferUpdate().catch(() => {});
         if (!stopped) {
           await interaction.followUp({
@@ -524,9 +998,10 @@ export function createInteractionHandler(
       }
 
       if (interaction.customId === 'xangi_new') {
-        deleteSession(channelId);
+        closeActiveSession(channelId, 'new');
         agentRunner.destroy?.(channelId);
         discordToolHistoryByMessageId.delete(interaction.message.id);
+        discordReplySuggestionsByMessageId.delete(interaction.message.id);
         // ボタンを消してメッセージを更新
         await interaction
           .update({
@@ -539,36 +1014,84 @@ export function createInteractionHandler(
         return;
       }
 
-      if (interaction.customId === 'xangi_tools') {
-        const toolHistory = discordToolHistoryByMessageId.get(interaction.message.id);
-        if (!toolHistory || toolHistory.length === 0) {
-          await interaction
-            .reply({ content: 'ツール履歴はありません', ephemeral: true })
-            .catch(() => {});
-          return;
-        }
-        const chunks = splitMessage(`ツール履歴\n${toolHistory.join('\n')}`, DISCORD_SAFE_LENGTH);
-        await interaction.reply({
-          content: chunks[0] || 'ツール履歴はありません',
-          ephemeral: true,
+      if (
+        interaction.customId === 'xangi_tools' ||
+        interaction.customId.startsWith('xangi_tools|')
+      ) {
+        const historyContext = parseDiscordHistoryCustomId(interaction.customId);
+        await respondWithDiscordTurnHistory(interaction, () => {
+          const cached = discordToolHistoryByMessageId.get(interaction.message.id);
+          if (cached?.length) return cached;
+          if (!historyContext) return [];
+          return readTurnHistory(historyContext.threadId, 200).filter(
+            (entry) => entry.turnId === historyContext.turnId
+          );
         });
-        for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], ephemeral: true }).catch(() => {});
-        }
         return;
       }
 
-      // 承認ボタン
-      if (interaction.customId.startsWith('xangi_approve_')) {
-        const approvalId = interaction.customId.replace('xangi_approve_', '');
-        resolveApproval(approvalId, true);
-        await interaction.update({ content: '✅ 許可しました', components: [] }).catch(() => {});
+      if (interaction.customId === 'xangi_reply_suggestions') {
+        const suggestions = discordReplySuggestionsByMessageId.get(interaction.message.id);
+        if (!suggestions || suggestions.length === 0) {
+          await interaction.reply({
+            content: 'この返信候補は期限切れです',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        await interaction.reply({
+          content: formatNumberedSuggestions(suggestions),
+          components: [createReplySuggestionButtons(interaction.message.id, suggestions.length)],
+          flags: MessageFlags.Ephemeral,
+        });
         return;
       }
-      if (interaction.customId.startsWith('xangi_deny_')) {
-        const approvalId = interaction.customId.replace('xangi_deny_', '');
-        resolveApproval(approvalId, false);
-        await interaction.update({ content: '❌ 拒否しました', components: [] }).catch(() => {});
+
+      if (interaction.customId.startsWith('xangi_reply_suggestion_')) {
+        const match = /^xangi_reply_suggestion_(\d+)_(\d+)$/.exec(interaction.customId);
+        const sourceMessageId = match?.[1];
+        const index = Number(match?.[2]);
+        const suggestions = sourceMessageId
+          ? discordReplySuggestionsByMessageId.get(sourceMessageId)
+          : undefined;
+        const suggestion = Number.isInteger(index) ? suggestions?.[index] : undefined;
+        if (!suggestion || !onReplySuggestion) {
+          await interaction.reply({
+            content: 'この返信候補は期限切れです',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        await interaction.update({ content: `送信: ${suggestion}`, components: [] });
+        await onReplySuggestion(interaction, suggestion).catch(async (error) => {
+          console.error('[xangi] Reply suggestion failed:', error);
+          await interaction.followUp({
+            content: formatAgentErrorForUser(error),
+            flags: MessageFlags.Ephemeral,
+          });
+        });
+        return;
+      }
+
+      if (interaction.customId === 'xangi_thread_leave') {
+        await interaction.deferReply({ ephemeral: true }).catch(() => {});
+        if (!interaction.channel?.isThread()) {
+          await interaction.editReply('❌ このボタンはスレッド内でのみ使えます').catch(() => {});
+          return;
+        }
+        try {
+          await removeUserFromDiscordThread(interaction.channel, interaction.user.id);
+          closeActiveSession(channelId, 'leave');
+          agentRunner.destroy?.(channelId);
+          discordToolHistoryByMessageId.delete(interaction.message.id);
+          discordReplySuggestionsByMessageId.delete(interaction.message.id);
+          await interaction
+            .editReply('🚪 セッションを終了して、このスレッドから退出しました')
+            .catch(() => {});
+        } catch (error) {
+          console.error('[xangi] Failed to leave Discord thread:', error);
+          await interaction.editReply(formatThreadLeaveError(error)).catch(() => {});
+        }
         return;
       }
 
@@ -589,16 +1112,94 @@ export function createInteractionHandler(
     }
 
     const channelId = interaction.channelId;
+    const settingsChannelId = resolveDiscordSettingsChannelId(
+      channelId,
+      (interaction.channel ?? {}) as {
+        isThread?: () => boolean;
+        parentId?: string | null;
+      }
+    );
+
+    if (interaction.commandName === 'workspace') {
+      const subcommand = interaction.options.getSubcommand();
+      try {
+        if (subcommand === 'show') {
+          const selected = await workspaceRegistry.resolve('discord', settingsChannelId);
+          const activeId = getActiveSessionId(channelId);
+          const active = activeId ? getSessionEntry(activeId) : undefined;
+          const activeWorkspace = active?.workspaceId
+            ? workspaceRegistry.getById(active.workspaceId)
+            : undefined;
+          await interaction.reply({
+            content: [
+              `チャンネル設定: ${selected.name}`,
+              `パス: \`${selected.path}\``,
+              activeWorkspace
+                ? `現在のセッション: ${activeWorkspace.name}（変更は次の /new から反映）`
+                : '現在のセッション: 未固定',
+            ].join('\n'),
+            ephemeral: true,
+          });
+          return;
+        }
+        if (subcommand === 'list') {
+          const lines = workspaceRegistry
+            .list()
+            .map(
+              (workspace) =>
+                `- ${workspace.name}${workspace.isDefault ? ' (default)' : ''}: \`${workspace.path}\``
+            );
+          await interaction.reply({
+            content: ['登録済みワークスペース', ...lines].join('\n'),
+            ephemeral: true,
+          });
+          return;
+        }
+        if (subcommand === 'set') {
+          const workspace = await workspaceRegistry.register(
+            interaction.options.getString('name', true),
+            interaction.options.getString('path', true)
+          );
+          await workspaceRegistry.bind('discord', settingsChannelId, workspace.id);
+          await interaction.reply({
+            content: `${workspace.name} を登録・設定しました。次の /new から \`${workspace.path}\` を使います。`,
+            ephemeral: true,
+          });
+          return;
+        }
+        if (subcommand === 'use') {
+          const name = interaction.options.getString('name', true);
+          const workspace = workspaceRegistry.getByName(name);
+          if (!workspace) throw new Error(`Workspace not found: ${name}`);
+          await workspaceRegistry.bind('discord', settingsChannelId, workspace.id);
+          await interaction.reply({
+            content: `${workspace.name} を設定しました。次の /new から \`${workspace.path}\` を使います。`,
+            ephemeral: true,
+          });
+          return;
+        }
+        await workspaceRegistry.resetBinding('discord', settingsChannelId);
+        const workspace = await workspaceRegistry.resolve('discord', settingsChannelId);
+        await interaction.reply({
+          content: `defaultへ戻しました。次の /new から \`${workspace.path}\` を使います。`,
+          ephemeral: true,
+        });
+      } catch (error) {
+        await interaction.reply({ content: formatAgentErrorForUser(error), ephemeral: true });
+      }
+      return;
+    }
 
     if (interaction.commandName === 'new') {
-      deleteSession(channelId);
+      closeActiveSession(channelId, 'new');
       agentRunner.destroy?.(channelId);
       await interaction.reply('🆕 新しいセッションを開始しました');
       return;
     }
 
     if (interaction.commandName === 'stop') {
-      const stopped = processManager.stop(channelId) || agentRunner.cancel?.(channelId) || false;
+      const managedProcessStopped = await processManager.stopAndWait(channelId);
+      const stopped = managedProcessStopped || agentRunner.cancel?.(channelId) || false;
       if (stopped) {
         await interaction.reply('🛑 タスクを停止しました');
       } else {
@@ -615,278 +1216,56 @@ export function createInteractionHandler(
 
     if (interaction.commandName === 'notify') {
       const mode = interaction.options.getString('mode', true) as
-        | DiscordCompletionNotifyMode
-        | 'default'
-        | 'show';
-      const settings = loadSettings();
-      const defaultMode = config.discord.completionNotifyMode ?? 'message';
-      const currentOverride = settings.discordCompletionNotifyChannels?.[channelId];
-
-      if (mode === 'show') {
-        const effectiveMode = getChannelCompletionNotifyMode(settings, channelId, defaultMode);
-        const thresholdMs = config.discord.completionNotifyAfterMs ?? 10_000;
-        const lines = [
-          `🔔 完了通知設定 (<#${channelId}>)`,
-          `- 適用中: \`${effectiveMode}\``,
-          `- チャンネル設定: ${currentOverride ? `\`${currentOverride}\`` : 'なし'}`,
-          `- 起動時デフォルト: \`${defaultMode}\``,
-          `- 通知閾値: \`${thresholdMs}ms\``,
-          `- 対象: 通常の Discord メッセージターンのみ（スケジュール起点は通知なし）`,
-        ];
-        await interaction.reply(lines.join('\n'));
-        return;
-      }
-
-      const nextChannels = { ...(settings.discordCompletionNotifyChannels ?? {}) };
-      if (mode === 'default') {
-        delete nextChannels[channelId];
-      } else {
-        nextChannels[channelId] = mode;
-      }
-
-      const saved = saveSettings({
-        discordCompletionNotifyChannels:
-          Object.keys(nextChannels).length > 0 ? nextChannels : undefined,
-      });
-      const effectiveMode = getChannelCompletionNotifyMode(saved, channelId, defaultMode);
-      const action =
-        mode === 'default'
-          ? `起動時デフォルト \`${defaultMode}\` に戻しました`
-          : `\`${mode}\` に設定しました`;
+        DiscordCompletionNotifyMode | 'default' | 'show';
       await interaction.reply(
-        `🔔 <#${channelId}> の完了通知を${action}\n現在の適用値: \`${effectiveMode}\`\n対象: 通常の Discord メッセージターンのみ（スケジュール起点は通知なし）`
+        await executeRuntimeSettingsCommand(
+          {
+            name: 'notify',
+            action: mode === 'default' ? 'reset' : mode === 'show' ? 'show' : 'set',
+            value: mode,
+            channelId: settingsChannelId,
+            platform: 'discord',
+          },
+          { config, resolver }
+        )
       );
       return;
     }
 
     if (interaction.commandName === 'backend') {
       const sub = interaction.options.getSubcommand();
-
-      if (sub === 'show') {
-        const resolved = agentRunner.resolveForChannel(channelId);
-        const override = resolver.getChannelOverride(channelId);
-        const defaultRes = resolver.getDefault();
-        const lines = [
-          `**現在のバックエンド設定** (<#${channelId}>)`,
-          `- バックエンド: **${getBackendDisplayName(resolved.backend)}**`,
-        ];
-        if (resolved.model) lines.push(`- モデル: ${resolved.model}`);
-        if (resolved.effort) lines.push(`- effort: ${resolved.effort}`);
-        if (override) {
-          lines.push(`- ソース: チャンネル設定`);
-        } else {
-          lines.push(`- ソース: デフォルト (.env)`);
-        }
-
-        // Local LLM のとき詳細情報を併記
-        if (resolved.backend === 'local-llm') {
-          const llmBase = process.env.LOCAL_LLM_BASE_URL || 'http://localhost:11434';
-          const llmModelEnv = process.env.LOCAL_LLM_MODEL;
-          const llmMode = process.env.LOCAL_LLM_MODE ?? 'agent (default)';
-          const numCtx = process.env.LOCAL_LLM_NUM_CTX ?? '(モデルデフォルト)';
-          const temperature = process.env.LOCAL_LLM_TEMPERATURE ?? '(モデルデフォルト = 1.0)';
-          const maxTokens = process.env.LOCAL_LLM_MAX_TOKENS ?? '8192 (default)';
-          const thinking = process.env.LOCAL_LLM_THINKING ?? 'false (default)';
-
-          lines.push('', '**Local LLM 詳細:**');
-          lines.push(`- base_url: \`${llmBase}\``);
-          if (!resolved.model && llmModelEnv) lines.push(`- model (env): \`${llmModelEnv}\``);
-          lines.push(`- mode: \`${llmMode}\``);
-          lines.push(`- num_ctx: \`${numCtx}\``);
-          lines.push(`- temperature: \`${temperature}\``);
-          lines.push(`- max_tokens: \`${maxTokens}\``);
-          lines.push(`- thinking: \`${thinking}\``);
-        }
-
-        lines.push(
-          ``,
-          `**デフォルト:** ${getBackendDisplayName(defaultRes.backend)}${defaultRes.model ? ` (${defaultRes.model})` : ''}`
-        );
-        await interaction.reply(lines.join('\n'));
-        return;
-      }
-
-      if (sub === 'set') {
-        const backendValue = interaction.options.getString('type', true) as AgentBackend;
-        const modelValue = interaction.options.getString('model') ?? undefined;
-        const rawEffort = interaction.options.getString('effort');
-        const effortValue =
-          rawEffort && rawEffort !== 'none' ? (rawEffort as EffortLevel) : undefined;
-
-        // 許可チェック: ALLOWED_BACKENDS 未設定時は全 backend 許可
-        if (!resolver.isBackendAllowed(backendValue)) {
-          const allowedBackends = resolver.getAllowedBackends();
-          await interaction.reply({
-            content: `❌ バックエンド \`${backendValue}\` は許可されていません\n許可: ${allowedBackends.map((b) => getBackendDisplayName(b)).join(', ')}`,
-            ephemeral: true,
-          });
-          return;
-        }
-        if (modelValue && !resolver.isModelAllowed(modelValue)) {
-          await interaction.reply({
-            content: `❌ モデル \`${modelValue}\` は許可されていません`,
-            ephemeral: true,
-          });
-          return;
-        }
-
-        // Local LLMの場合、Ollamaにモデルが存在するか確認
-        if (backendValue === 'local-llm' && modelValue) {
-          try {
-            const ollamaBase = process.env.LOCAL_LLM_BASE_URL || 'http://localhost:11434';
-            const res = await fetch(`${ollamaBase}/api/tags`, {
-              signal: AbortSignal.timeout(3000),
-            });
-            if (res.ok) {
-              const data = (await res.json()) as {
-                models?: Array<{ name: string }>;
-              };
-              const modelNames = data.models?.map((m) => m.name) ?? [];
-              // "qwen3.5:9b" と "qwen3.5:9b" の完全一致、または "qwen3.5" のようなプレフィックス一致
-              const found = modelNames.some(
-                (n) => n === modelValue || n.startsWith(modelValue + ':')
-              );
-              if (!found) {
-                await interaction.reply({
-                  content: `❌ モデル \`${modelValue}\` はOllamaにインストールされていません\nインストール済み: ${modelNames.map((n) => `\`${n}\``).join(', ')}`,
-                  ephemeral: true,
-                });
-                return;
-              }
-            }
-          } catch {
-            // Ollama接続失敗は無視（モデル確認をスキップ）
-          }
-        }
-
-        // channelOverrides に保存
-        resolver.setChannelOverride(channelId, {
+      const backendValue =
+        sub === 'set' ? (interaction.options.getString('type', true) as AgentBackend) : undefined;
+      const modelValue =
+        sub === 'set' ? (interaction.options.getString('model') ?? undefined) : undefined;
+      const rawEffort = sub === 'set' ? interaction.options.getString('effort') : undefined;
+      const effortValue =
+        rawEffort && rawEffort !== 'none' ? (rawEffort as EffortLevel) : undefined;
+      const result = await executeRuntimeSettingsCommand(
+        {
+          name: 'backend',
+          action: sub,
           backend: backendValue,
           model: modelValue,
           effort: effortValue,
-        });
+          channelId: settingsChannelId,
+          platform: 'discord',
+        },
+        { config, resolver, modelDiscovery: discoverBackendModels }
+      );
+      if (sub !== 'show') agentRunner.switchBackend(settingsChannelId);
+      await interaction.reply(result);
+      return;
+    }
 
-        // セッション & ランナー破棄
-        agentRunner.switchBackend(channelId);
-
-        // 切り替え結果を明確に表示
-        const display = getBackendDisplayName(backendValue);
-        const resolvedModel =
-          modelValue ||
-          (backendValue === 'local-llm'
-            ? process.env.LOCAL_LLM_MODEL || '(デフォルト)'
-            : backendValue === 'claude-code'
-              ? process.env.AGENT_MODEL || 'Claude (デフォルト)'
-              : backendValue === 'cursor'
-                ? process.env.AGENT_MODEL || 'Cursor (デフォルト)'
-                : backendValue === 'grok'
-                  ? process.env.AGENT_MODEL || 'Grok (デフォルト)'
-                  : backendValue === 'antigravity'
-                    ? process.env.AGENT_MODEL || 'Antigravity (デフォルト)'
-                    : '(デフォルト)');
-        const lines = [
-          `🔄 モデルを切り替えました。新しいセッションを開始します。`,
-          `- バックエンド: **${display}**`,
-          `- モデル: **${resolvedModel}**`,
-        ];
-        if (effortValue) lines.push(`- effort: **${effortValue}**`);
-        await interaction.reply(lines.join('\n'));
-        return;
-      }
-
-      if (sub === 'reset') {
-        resolver.deleteChannelOverride(channelId);
-        agentRunner.switchBackend(channelId);
-        const defaultRes = resolver.getDefault();
-        await interaction.reply(
-          `🔄 デフォルト (**${getBackendDisplayName(defaultRes.backend)}**) に戻しました。新しいセッションを開始します。`
-        );
-        return;
-      }
-
-      if (sub === 'list') {
-        await interaction.deferReply();
-        const allowed = resolver.getAllowedBackends();
-        const allowedModels = resolver.getAllowedModels();
-        const defaultRes = resolver.getDefault();
-        const lines = ['**利用可能なバックエンド:**'];
-        for (const b of allowed) {
-          const isDefault = b === defaultRes.backend;
-          lines.push(`- ${getBackendDisplayName(b)}${isDefault ? ' (デフォルト)' : ''}`);
-        }
-        if (allowedModels && allowedModels.length > 0) {
-          lines.push('', '**許可モデル:**');
-          for (const m of allowedModels) {
-            lines.push(`- \`${m}\``);
-          }
-        }
-
-        // Local LLM モデル一覧を取得（許可されている場合）
-        // Ollama (`/api/tags`) と vLLM / OpenAI 互換 (`/v1/models`) の両方に対応
-        if (allowed.includes('local-llm')) {
-          const llmBase = process.env.LOCAL_LLM_BASE_URL || 'http://localhost:11434';
-          let modelsShown = false;
-
-          // Ollama 経路
-          try {
-            const res = await fetch(`${llmBase}/api/tags`, {
-              signal: AbortSignal.timeout(3000),
-            });
-            if (res.ok) {
-              const data = (await res.json()) as {
-                models?: Array<{ name: string; size: number }>;
-              };
-              if (data.models && data.models.length > 0) {
-                lines.push('', '**Ollamaモデル（インストール済み）:**');
-                for (const m of data.models) {
-                  const sizeGB = (m.size / 1e9).toFixed(1);
-                  lines.push(`- \`${m.name}\` (${sizeGB}GB)`);
-                }
-                modelsShown = true;
-              }
-            }
-          } catch {
-            // Ollama 未起動・別サーバーの可能性 → fallback へ
-          }
-
-          // vLLM / OpenAI 互換経路 (Ollama で取れなかった場合のフォールバック)
-          if (!modelsShown) {
-            try {
-              const res = await fetch(`${llmBase}/v1/models`, {
-                signal: AbortSignal.timeout(3000),
-              });
-              if (res.ok) {
-                const data = (await res.json()) as {
-                  data?: Array<{ id: string; max_model_len?: number; owned_by?: string }>;
-                };
-                if (data.data && data.data.length > 0) {
-                  lines.push('', '**Local LLM モデル（OpenAI互換API）:**');
-                  for (const m of data.data) {
-                    const ctx = m.max_model_len
-                      ? ` (max_model_len: ${m.max_model_len.toLocaleString()})`
-                      : '';
-                    const owner = m.owned_by ? ` [${m.owned_by}]` : '';
-                    lines.push(`- \`${m.id}\`${ctx}${owner}`);
-                  }
-                  modelsShown = true;
-                }
-              }
-            } catch {
-              // 両方失敗 → 警告表示
-            }
-          }
-
-          if (!modelsShown) {
-            lines.push(
-              '',
-              `⚠️ Local LLM サーバー (\`${llmBase}\`) からモデル一覧を取得できませんでした。Ollama (\`/api/tags\`) も OpenAI互換 (\`/v1/models\`) も応答なし。`
-            );
-          }
-        }
-
-        await interaction.editReply(lines.join('\n'));
-        return;
-      }
+    if (interaction.commandName === 'models') {
+      await interaction.deferReply();
+      const backend = interaction.options.getString('backend') ?? undefined;
+      const content = await executeModelsCommand(backend, resolver);
+      const chunks = splitDiscordMessage(content, DISCORD_SAFE_LENGTH);
+      await interaction.editReply(chunks[0]);
+      for (const chunk of chunks.slice(1)) await interaction.followUp(chunk);
+      return;
     }
 
     if (interaction.commandName === 'skip') {
@@ -895,15 +1274,25 @@ export function createInteractionHandler(
 
       try {
         const sessionId = getSession(channelId);
-        const appSessionId = ensureSession(channelId, { platform: 'discord' });
+        const { appSessionId, workspace } = await ensureSessionWithWorkspace({
+          registry: workspaceRegistry,
+          platform: 'discord',
+          contextKey: channelId,
+          bindingKey: settingsChannelId,
+        });
 
         // ワンショットのClaudeCodeRunnerを使用（skipPermissionsを確実に反映するため）
-        const skipRunner = new ClaudeCodeRunner(config.agent.config);
+        const skipRunner = new ClaudeCodeRunner({
+          ...config.agent.config,
+          workdir: workspace?.path ?? config.agent.config.workdir,
+        });
         const runResult = await skipRunner.run(skipMessage, {
           skipPermissions: true,
           sessionId,
           channelId,
+          settingsChannelId,
           appSessionId,
+          workdir: workspace?.path,
         });
 
         setSession(channelId, runResult.sessionId);
@@ -912,10 +1301,11 @@ export function createInteractionHandler(
         // 添付ゼロでも実在しない MEDIA マーカーが残る場合は生成失敗の注記に差し替える
         const { filePaths, displayText } = buildAttachmentResult(
           runResult.result,
-          runResult.attachments
+          runResult.attachments,
+          workspace?.path
         );
 
-        const chunks = splitMessage(displayText, DISCORD_SAFE_LENGTH);
+        const chunks = splitDiscordMessage(displayText, DISCORD_SAFE_LENGTH);
         await interaction.editReply(chunks[0] || '✅');
         if (chunks.length > 1 && 'send' in interaction.channel!) {
           const channel = interaction.channel as unknown as {
@@ -953,28 +1343,39 @@ export function createInteractionHandler(
         await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
         return;
       }
-      const chId = interaction.channelId;
-      const channels = config.discord.autoReplyChannels ?? [];
-      const idx = channels.indexOf(chId);
-      const isCurrentlyOn = idx !== -1;
+      const mode = interaction.options.getString('mode', true) as 'show' | 'on' | 'off' | 'default';
+      await interaction.reply(
+        await executeRuntimeSettingsCommand(
+          {
+            name: 'autoreply',
+            action: mode === 'default' ? 'reset' : mode === 'show' ? 'show' : 'set',
+            value: mode,
+            // autoreply はスレッド単位で設定できるよう、親チャンネルIDへ丸めない。
+            // 他の設定コマンドは従来どおり settingsChannelId (親チャンネル) を対象にする。
+            channelId,
+            parentChannelId: settingsChannelId !== channelId ? settingsChannelId : undefined,
+            platform: 'discord',
+          },
+          { config, resolver }
+        )
+      );
+      return;
+    }
 
-      if (isCurrentlyOn) {
-        // OFF: メモリから削除
-        channels.splice(idx, 1);
-      } else {
-        // ON: メモリに追加
-        channels.push(chId);
-      }
-      config.discord.autoReplyChannels = channels;
-
-      // .env に永続化 (Docker 環境で .env ファイルが無い場合は graceful skip)
-      const persistResult = updateEnvKeyValue('AUTO_REPLY_CHANNELS', channels.join(','));
-      if (!persistResult.ok) {
-        console.warn(`[xangi] AUTO_REPLY_CHANNELS persistence skipped: ${persistResult.reason}`);
-      }
-
-      const status = isCurrentlyOn ? '❌ OFF' : '✅ ON';
-      await interaction.reply(`メンションなし応答: ${status} (<#${chId}>)`);
+    if (interaction.commandName === 'replysuggestions') {
+      const mode = interaction.options.getString('mode', true) as 'show' | 'on' | 'off' | 'default';
+      await interaction.reply(
+        await executeRuntimeSettingsCommand(
+          {
+            name: 'replysuggestions',
+            action: mode === 'default' ? 'reset' : mode === 'show' ? 'show' : 'set',
+            value: mode,
+            channelId: settingsChannelId,
+            platform: 'discord',
+          },
+          { config, resolver }
+        )
+      );
       return;
     }
 
@@ -983,30 +1384,40 @@ export function createInteractionHandler(
         await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
         return;
       }
-      const wasEnabled = config.discord.respondToBotsEnabled ?? false;
-      const nextEnabled = !wasEnabled;
-      config.discord.respondToBotsEnabled = nextEnabled;
-
-      // .env に永続化 (Docker 環境で .env ファイルが無い場合は graceful skip)
-      const persistResult = updateEnvKeyValue(
-        'RESPOND_TO_BOTS_ENABLED',
-        nextEnabled ? 'true' : 'false'
+      await interaction.reply(
+        await executeRuntimeSettingsCommand(
+          {
+            name: 'respondtobots',
+            action: 'set',
+            value: config.discord.respondToBotsEnabled ? 'off' : 'on',
+            channelId: settingsChannelId,
+            platform: 'discord',
+          },
+          { config, resolver }
+        )
       );
-      if (!persistResult.ok) {
-        console.warn(
-          `[xangi] RESPOND_TO_BOTS_ENABLED persistence skipped: ${persistResult.reason}`
-        );
+      return;
+    }
+
+    if (interaction.commandName === 'threadmode') {
+      if (!config.discord.allowThreadModeCommand) {
+        await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
+        return;
       }
 
-      const whitelist = config.discord.respondToBots ?? [];
-      const target =
-        whitelist.length === 0
-          ? '(RESPOND_TO_BOTS 未設定)'
-          : whitelist.includes('*')
-            ? '全 bot'
-            : whitelist.join(', ');
-      const status = nextEnabled ? '✅ ON' : '❌ OFF';
-      await interaction.reply(`bot メッセージへの応答: ${status} / 反応対象: ${target}`);
+      const mode = interaction.options.getString('mode', true) as 'show' | 'on' | 'off' | 'default';
+      await interaction.reply(
+        await executeRuntimeSettingsCommand(
+          {
+            name: 'threadmode',
+            action: mode === 'default' ? 'reset' : mode === 'show' ? 'show' : 'set',
+            value: mode,
+            channelId: settingsChannelId,
+            platform: 'discord',
+          },
+          { config, resolver }
+        )
+      );
       return;
     }
 
@@ -1015,74 +1426,73 @@ export function createInteractionHandler(
         await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
         return;
       }
-      const chId = interaction.channelId;
       const mode = interaction.options.getString('mode', true) as
-        | 'agent'
-        | 'lite'
-        | 'chat'
-        | 'default'
-        | 'show';
+        'agent' | 'chat' | 'default' | 'show';
+      await interaction.reply(
+        await executeRuntimeSettingsCommand(
+          {
+            name: 'llmmode',
+            action: mode === 'default' ? 'reset' : mode === 'show' ? 'show' : 'set',
+            value: mode,
+            channelId: settingsChannelId,
+            platform: 'discord',
+          },
+          { config, resolver }
+        )
+      );
+      return;
+    }
 
-      // show: 現在の設定を表示するだけ
-      if (mode === 'show') {
-        const current = resolver.getChannelOverride(chId);
-        const resolved = resolver.resolve(chId);
+    if (interaction.commandName === 'llmeffort') {
+      if (!config.discord.allowLlmEffortCommand) {
+        await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
+        return;
+      }
+      const level = interaction.options.getString('level', true) as
+        LocalLlmReasoningEffort | 'default' | 'show';
+      const override = resolver.getChannelOverride(settingsChannelId);
+      const startupDefaultRaw = process.env.LOCAL_LLM_REASONING_EFFORT?.trim().toLowerCase();
+      const startupDefault = LOCAL_LLM_REASONING_EFFORTS.includes(
+        startupDefaultRaw as LocalLlmReasoningEffort
+      )
+        ? (startupDefaultRaw as LocalLlmReasoningEffort)
+        : undefined;
 
-        // 起動時 env LOCAL_LLM_MODE（未指定なら 'agent' default）
-        const envMode = (process.env.LOCAL_LLM_MODE || '').toLowerCase();
-        const startupMode =
-          envMode === 'agent' || envMode === 'lite' || envMode === 'chat' ? envMode : 'agent';
-
-        // 実際に適用される mode（チャンネル override 優先、無ければ起動時 env）
-        const appliedMode = resolved.localLlmMode ?? startupMode;
-        const source = resolved.localLlmMode
-          ? 'チャンネル個別 override (CHANNEL_OVERRIDES)'
-          : envMode
-            ? `起動時 env LOCAL_LLM_MODE=${envMode}`
-            : `起動時 default (LOCAL_LLM_MODE 未指定 → agent)`;
-
-        const lines: string[] = [
-          `📍 <#${chId}> の Local LLM 設定`,
-          ``,
-          `**適用中のモード:** \`${appliedMode}\``,
-          `**由来:** ${source}`,
-          ``,
-          `### 設定の内訳`,
-          `- backend: \`${resolved.backend}\``,
-          `- model: ${resolved.model ? `\`${resolved.model}\`` : '(env デフォルト)'}`,
-          `- 起動時 env \`LOCAL_LLM_MODE\`: \`${envMode || '(未指定 → agent)'}\``,
-          `- チャンネル override (\`localLlmMode\`): ${current?.localLlmMode ? `\`${current.localLlmMode}\`` : 'なし'}`,
-          ``,
-          `### モード別の機能`,
-          `- \`agent\`: tools / skills / xangi-commands ON、triggers OFF`,
-          `- \`lite\`: tools / xangi-commands / triggers ON、skills OFF`,
-          `- \`chat\`: 全機能 OFF（純粋会話）`,
-        ];
-        await interaction.reply(lines.join('\n'));
+      if (level === 'show') {
+        const current = override?.localLlmReasoningEffort ?? startupDefault;
+        const source = override?.localLlmReasoningEffort
+          ? 'チャンネル設定'
+          : startupDefault
+            ? '起動時デフォルト'
+            : 'providerデフォルト';
+        await interaction.reply(
+          `Local LLM reasoning effort: \`${current || '未指定'}\`（${source}）`
+        );
         return;
       }
 
-      // default: override 削除（その他のフィールドは保持）
-      if (mode === 'default') {
-        resolver.setChannelLocalLlmMode(chId, null);
-        await interaction.reply(`✅ <#${chId}> の Local LLM mode override を削除しました`);
-        return;
-      }
-
-      // agent / lite / chat: 設定
-      resolver.setChannelLocalLlmMode(chId, mode);
-      await interaction.reply(`✅ <#${chId}> の Local LLM mode を \`${mode}\` に設定しました`);
+      resolver.setChannelLocalLlmReasoningEffort(
+        settingsChannelId,
+        level === 'default' ? null : level
+      );
+      await interaction.reply(
+        level === 'default'
+          ? `Local LLM reasoning effort のチャンネル設定を削除しました。次の送信から \`${startupDefault || 'providerデフォルト'}\` を使います。`
+          : `Local LLM reasoning effort を \`${level}\` に設定しました。次の送信から適用されます。`
+      );
       return;
     }
 
     if (interaction.commandName === 'restart') {
-      const settings = loadSettings();
-      if (!settings.autoRestart) {
-        await interaction.reply('⚠️ 自動再起動が無効です。先に有効にしてください。');
+      const selfLifecycle = getSelfLifecyclePermission();
+      if (!canSelfRestart(selfLifecycle)) {
+        await interaction.reply(
+          '⚠️ 自己再起動が無効です。管理者が `.env` の `XANGI_SELF_LIFECYCLE=restart-only` を設定し、xangi を再起動してください。'
+        );
         return;
       }
       await interaction.reply('🔄 再起動します...');
-      setTimeout(() => process.exit(0), 1000);
+      requestProcessRestart(1000);
       return;
     }
 
@@ -1091,16 +1501,22 @@ export function createInteractionHandler(
       return;
     }
 
-    if (interaction.commandName === 'skills') {
-      // スキルを再読み込み
-      skillsRef.current = loadSkills(workdir);
-      await interaction.reply(formatSkillList(skillsRef.current));
-      return;
-    }
-
     if (interaction.commandName === 'skill') {
-      const skillName = interaction.options.getString('name', true);
-      await handleSkillCommand(interaction, agentRunner, config, channelId, skillName);
+      const skillName = interaction.options.getString('name');
+      skillsRef.current = loadSkills(workdir);
+      if (!skillName) {
+        await interaction.reply(formatSkillList(skillsRef.current));
+        return;
+      }
+      await handleSkillCommand(
+        interaction,
+        agentRunner,
+        config,
+        channelId,
+        settingsChannelId,
+        skillName,
+        workspaceRegistry
+      );
       return;
     }
 
@@ -1110,7 +1526,15 @@ export function createInteractionHandler(
     );
 
     if (matchedSkill) {
-      await handleSkillCommand(interaction, agentRunner, config, channelId, matchedSkill.name);
+      await handleSkillCommand(
+        interaction,
+        agentRunner,
+        config,
+        channelId,
+        settingsChannelId,
+        matchedSkill.name,
+        workspaceRegistry
+      );
       return;
     }
   };

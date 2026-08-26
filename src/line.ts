@@ -8,12 +8,17 @@
  * - contextKey = `line:<userId>` で per-userId セッション分離
  * - allowedUsers (LINE userId allowlist) で送受信を絞れる ("*" で全許可)
  */
-import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http';
 import { LineBotClient, validateSignature, type webhook } from '@line/bot-sdk';
-import type { AgentRunner } from './agent-runner.js';
+import type { AgentRunner, RunResult } from './agent-runner.js';
+import { buildCompletionSummary, type CompletionDisplayOptions } from './completion-summary.js';
+import type { BackendResolver } from './backend-resolver.js';
 import { ensureSession, getActiveSessionId, getSessionEntry, archiveSession } from './sessions.js';
 import { threadIdFor, turnIdFor } from './events-emitter.js';
 import { runWithBubbleEvents } from './bubble-events-runner.js';
+import { executeModelsCommand, parseModelsCommand } from './models-command.js';
+import { splitMessage } from './message-split.js';
+import { listenHttpServer } from './http-server-startup.js';
 
 const DEFAULT_PORT = 8765;
 const DEFAULT_PATH = '/webhook';
@@ -21,6 +26,15 @@ const LINE_CONTEXT_PREFIX = 'line:';
 
 // LINE text message は 5000 chars 制限 (公式仕様)
 const LINE_TEXT_MESSAGE_MAX = 5000;
+
+export function appendLineCompletionSummary(
+  text: string,
+  summary: string | undefined,
+  maxLength = LINE_TEXT_MESSAGE_MAX
+): string {
+  const suffix = summary ? `\n\n${summary}` : '';
+  return `${text.slice(0, Math.max(0, maxLength - suffix.length))}${suffix}`;
+}
 
 // Loading animation の許容値 (5の倍数、最大60)
 const LINE_LOADING_SECONDS_VALID: readonly number[] = [5, 10, 15, 20, 25, 30, 40, 50, 60];
@@ -101,6 +115,7 @@ export function snapLoadingSeconds(value: number | undefined): number {
 
 export interface LineBotOptions {
   agentRunner: AgentRunner;
+  resolver: BackendResolver;
   channelSecret: string;
   channelAccessToken: string;
   allowedUsers?: string[];
@@ -120,6 +135,8 @@ export interface LineBotOptions {
   idleResetHours?: number;
   /** Reset コマンドのテキストパターン (default: 規定パターン)。空配列を渡すと検出無効 */
   resetTextPatterns?: readonly string[];
+  completionDisplay?: CompletionDisplayOptions;
+  completionNotifyAfterMs?: number;
 }
 
 /**
@@ -132,8 +149,8 @@ export interface LineBotOptions {
  * `https://<funnel-host>/webhook` を LINE Developers コンソールの
  * Webhook URL に登録する。
  */
-export function startLineBot(options: LineBotOptions): void {
-  const { agentRunner, channelSecret, channelAccessToken } = options;
+export async function startLineBot(options: LineBotOptions): Promise<Server> {
+  const { agentRunner, resolver, channelSecret, channelAccessToken } = options;
   const port = options.port ?? DEFAULT_PORT;
   const path = options.path ?? DEFAULT_PATH;
   const allowedUsers = options.allowedUsers ?? [];
@@ -147,6 +164,10 @@ export function startLineBot(options: LineBotOptions): void {
   const idleResetHours = options.idleResetHours ?? LINE_IDLE_RESET_HOURS_DEFAULT;
   const idleResetMs = Math.max(0, idleResetHours * 3600 * 1000);
   const resetTextPatterns = options.resetTextPatterns ?? LINE_RESET_TEXT_PATTERNS_DEFAULT;
+  const completionDisplay = options.completionDisplay ?? {
+    showElapsed: true,
+  };
+  const completionNotifyAfterMs = options.completionNotifyAfterMs ?? 10_000;
 
   const client = LineBotClient.fromChannelAccessToken({ channelAccessToken });
 
@@ -156,6 +177,7 @@ export function startLineBot(options: LineBotOptions): void {
         path,
         channelSecret,
         agentRunner,
+        resolver,
         client,
         allowedUsers,
         allowAll,
@@ -166,6 +188,8 @@ export function startLineBot(options: LineBotOptions): void {
         idleResetEnabled,
         idleResetMs,
         resetTextPatterns,
+        completionDisplay,
+        completionNotifyAfterMs,
       });
     } catch (err) {
       console.error('[xangi-line] request handler error:', err);
@@ -176,24 +200,27 @@ export function startLineBot(options: LineBotOptions): void {
     }
   });
 
-  server.listen(port, () => {
-    console.log(`[xangi-line] webhook listening on port ${port}, path ${path}`);
-    if (allowAll) {
-      console.log('[xangi-line] All LINE users are allowed');
-    } else if (allowedUsers.length > 0) {
-      console.log(`[xangi-line] Allowed users: ${allowedUsers.join(', ')}`);
-    } else {
-      console.warn(
-        '[xangi-line] ⚠️  LINE_ALLOWED_USER is empty — incoming messages will be ignored. Set "*" or a specific userId to enable.'
-      );
-    }
-  });
+  await listenHttpServer(server, port);
+  const address = server.address();
+  const actualPort = typeof address === 'object' && address ? address.port : port;
+  console.log(`[xangi-line] webhook listening on port ${actualPort}, path ${path}`);
+  if (allowAll) {
+    console.log('[xangi-line] All LINE users are allowed');
+  } else if (allowedUsers.length > 0) {
+    console.log(`[xangi-line] Allowed users: ${allowedUsers.join(', ')}`);
+  } else {
+    console.warn(
+      '[xangi-line] ⚠️  LINE_ALLOWED_USER is empty — incoming messages will be ignored. Set "*" or a specific userId to enable.'
+    );
+  }
+  return server;
 }
 
 interface HandlerContext {
   path: string;
   channelSecret: string;
   agentRunner: AgentRunner;
+  resolver: BackendResolver;
   client: LineBotClient;
   allowedUsers: string[];
   allowAll: boolean;
@@ -204,6 +231,8 @@ interface HandlerContext {
   idleResetEnabled: boolean;
   idleResetMs: number;
   resetTextPatterns: readonly string[];
+  completionDisplay: CompletionDisplayOptions;
+  completionNotifyAfterMs: number;
 }
 
 async function handleRequest(
@@ -292,6 +321,26 @@ async function handleEvent(event: webhook.Event, ctx: HandlerContext): Promise<v
 
   const contextKey = `${LINE_CONTEXT_PREFIX}${userId}`;
 
+  const modelsBackend = parseModelsCommand(text);
+  if (modelsBackend !== null) {
+    try {
+      const result = await executeModelsCommand(modelsBackend, ctx.resolver);
+      await ctx.client.replyMessage({
+        replyToken,
+        messages: splitMessage(result, LINE_TEXT_MESSAGE_MAX)
+          .slice(0, 5)
+          .map((chunk) => ({ type: 'text' as const, text: chunk })),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'モデル一覧の取得に失敗しました';
+      await ctx.client.replyMessage({
+        replyToken,
+        messages: [{ type: 'text', text: message.slice(0, LINE_TEXT_MESSAGE_MAX) }],
+      });
+    }
+    return;
+  }
+
   // Reset コマンド検出: テキストが reset patterns に一致したら現 session を archive、
   // 新 session を発番、確認テキストを返して Runner 起動はしない。
   // ユーザが明示的に「新しく話したい」と言ったときの即時応答経路。
@@ -368,7 +417,7 @@ async function handleEvent(event: webhook.Event, ctx: HandlerContext): Promise<v
   }
 
   const startTime = Date.now();
-  let runResult: { result?: string } | null = null;
+  let runResult: RunResult | null = null;
   let runError: unknown = null;
 
   try {
@@ -394,10 +443,13 @@ async function handleEvent(event: webhook.Event, ctx: HandlerContext): Promise<v
     }
   }
 
-  const replyText = runError
-    ? ERROR_FALLBACK_TEXT
-    : (runResult?.result || '').slice(0, LINE_TEXT_MESSAGE_MAX) || '…';
   const elapsedMs = Date.now() - startTime;
+  const rawReplyText = runError ? ERROR_FALLBACK_TEXT : runResult?.result || '…';
+  const completionSummary =
+    !runError && elapsedMs >= ctx.completionNotifyAfterMs
+      ? buildCompletionSummary({ elapsedMs }, ctx.completionDisplay)
+      : undefined;
+  const replyText = appendLineCompletionSummary(rawReplyText, completionSummary);
 
   // 送信経路の決定:
   //   - slow notice が発火済 → reply token 消費済なので push 必須
