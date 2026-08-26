@@ -4,7 +4,8 @@
  * 各 Web セッションは contextKey = `web-chat:<appSessionId>` で独立。
  * 同時に複数のセッションを保持・操作できる。
  */
-import { createServer } from 'http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import { timingSafeEqual } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'fs';
 import { join, dirname, extname, basename } from 'path';
 import { fileURLToPath } from 'url';
@@ -68,6 +69,66 @@ interface WebChatOptions {
   port?: number;
 }
 
+interface BasicAuthCredentials {
+  username: string;
+  password: string;
+}
+
+function loadBasicAuthCredentials(): BasicAuthCredentials | null {
+  const username = (process.env.WEB_CHAT_BASIC_AUTH_USER || '').trim();
+  const password = process.env.WEB_CHAT_BASIC_AUTH_PASSWORD || '';
+  if (!username && !password) return null;
+  if (!username || !password) {
+    console.warn(
+      '[xangi] WEB_CHAT_BASIC_AUTH_USER and WEB_CHAT_BASIC_AUTH_PASSWORD must be set together'
+    );
+    return null;
+  }
+  return { username, password };
+}
+
+function parseBasicAuthHeader(header: string | undefined): BasicAuthCredentials | null {
+  if (!header || !header.startsWith('Basic ')) return null;
+  try {
+    const decoded = Buffer.from(header.slice('Basic '.length), 'base64').toString('utf8');
+    const separator = decoded.indexOf(':');
+    if (separator < 0) return null;
+    return {
+      username: decoded.slice(0, separator),
+      password: decoded.slice(separator + 1),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function safeEqualString(actual: string, expected: string): boolean {
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  if (actualBytes.length !== expectedBytes.length) return false;
+  return timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function isBasicAuthAllowed(req: IncomingMessage): boolean {
+  const expected = loadBasicAuthCredentials();
+  if (!expected) return true;
+  const actual = parseBasicAuthHeader(req.headers.authorization);
+  return (
+    actual !== null &&
+    safeEqualString(actual.username, expected.username) &&
+    safeEqualString(actual.password, expected.password)
+  );
+}
+
+function sendBasicAuthRequired(res: ServerResponse): void {
+  res.writeHead(401, {
+    'WWW-Authenticate': 'Basic realm="xangi"',
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-cache',
+  });
+  res.end('Unauthorized');
+}
+
 export function startWebChat(options: WebChatOptions): void {
   const { agentRunner } = options;
   const port = options.port || parseInt(process.env.WEB_CHAT_PORT || String(DEFAULT_PORT), 10);
@@ -110,6 +171,11 @@ export function startWebChat(options: WebChatOptions): void {
     if (req.method === 'OPTIONS') {
       res.writeHead(200);
       res.end();
+      return;
+    }
+
+    if (!isBasicAuthAllowed(req)) {
+      sendBasicAuthRequired(res);
       return;
     }
 
