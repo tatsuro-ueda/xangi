@@ -81,7 +81,8 @@ export class CodexRunner extends CliRunnerBase {
     if (skip) {
       args.push('--dangerously-bypass-approvals-and-sandbox');
     } else {
-      args.push('--full-auto');
+      // codex CLI 0.148.0 で exec の --full-auto は廃止。同等のサンドボックスを --sandbox で指定する
+      args.push('--sandbox', 'workspace-write');
     }
 
     // gitリポジトリ外でも動作するように
