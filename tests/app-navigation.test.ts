@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AppNavigation, DESTINATIONS } from '../web-ui/src/AppNavigation.js';
+import { AppTopbar } from '../web-ui/src/AppTopbar.js';
 import { ThemeControl } from '../web-ui/src/ThemeSelect.js';
 
 describe('AppNavigation', () => {
@@ -18,21 +19,23 @@ describe('AppNavigation', () => {
     ]);
   });
 
-  it('marks the current destination and exposes the mobile more control', () => {
-    const html = renderToStaticMarkup(
-      createElement(AppNavigation, {
-        current: 'extensions',
-        moreOpen: false,
-        onMore: () => undefined,
-      })
-    );
+  it('keeps the primary destinations and the shared more menu in one header', () => {
+    const nav = renderToStaticMarkup(createElement(AppNavigation, { current: 'workspace' }));
+    vi.stubGlobal('window', { localStorage: { getItem: () => null } });
+    let header: string;
+    try {
+      header = renderToStaticMarkup(createElement(AppTopbar, { current: 'extensions' }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
 
-    expect(html).toContain('aria-label="xangiの主要機能"');
-    expect(html).toContain('href="/extensions"');
-    expect(html).toContain('aria-current="page"');
-    expect(html).toContain('aria-controls="app-more-sheet"');
-    expect(html).toContain('aria-expanded="false"');
-    expect(html).toContain('その他');
+    expect(nav).toContain('aria-label="xangiの主要機能"');
+    expect(nav).toContain('aria-current="page"');
+    expect(nav).not.toContain('href="/extensions"');
+    expect(header).toContain('href="/extensions"');
+    expect(header).toContain('aria-current="page"');
+    expect(header).toContain('<details class="app-more-menu">');
+    expect(header).toContain('ほか');
   });
 
   it('keeps the shared navigation fixed instead of overriding it per page', () => {
