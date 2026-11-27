@@ -1,11 +1,5 @@
 export type AppSurface = 'chat' | 'workspace' | 'schedules' | 'monitor' | 'extensions';
 
-interface AppNavigationProps {
-  current: AppSurface;
-  moreOpen: boolean;
-  onMore: () => void;
-}
-
 export const DESTINATIONS: Array<{
   id: AppSurface;
   href: string;
@@ -57,13 +51,7 @@ export function NavigationIcon({ icon }: { icon: AppSurface | 'more' | 'close' }
   if (icon === 'close') {
     return <path d="m6 6 12 12M18 6 6 18" />;
   }
-  return (
-    <>
-      <circle cx="6" cy="12" r="1" />
-      <circle cx="12" cy="12" r="1" />
-      <circle cx="18" cy="12" r="1" />
-    </>
-  );
+  return <path d="M5 6h14M5 12h14M5 18h14" />;
 }
 
 function DestinationLink({
@@ -87,9 +75,7 @@ function DestinationLink({
   );
 }
 
-export function AppNavigation({ current, moreOpen, onMore }: AppNavigationProps) {
-  const secondaryActive = current === 'monitor' || current === 'extensions';
-
+export function AppNavigation({ current }: { current: AppSurface }) {
   return (
     <nav className="app-navigation" aria-label="xangiの主要機能">
       <div className="app-navigation-primary">
@@ -99,25 +85,6 @@ export function AppNavigation({ current, moreOpen, onMore }: AppNavigationProps)
           )
         )}
       </div>
-      <div className="app-navigation-secondary">
-        {DESTINATIONS.filter((destination) => destination.placement === 'secondary').map(
-          (destination) => (
-            <DestinationLink destination={destination} current={current} key={destination.id} />
-          )
-        )}
-      </div>
-      <button
-        className={`app-more-trigger${secondaryActive ? ' active' : ''}`}
-        type="button"
-        aria-controls="app-more-sheet"
-        aria-expanded={moreOpen}
-        onClick={onMore}
-      >
-        <svg className="app-navigation-icon" viewBox="0 0 24 24" aria-hidden="true">
-          <NavigationIcon icon="more" />
-        </svg>
-        <span>その他</span>
-      </button>
     </nav>
   );
 }

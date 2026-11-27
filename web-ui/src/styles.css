@@ -1034,19 +1034,13 @@ button:disabled {
   gap: 8px;
 }
 
-.app-navigation-primary,
-.app-navigation-secondary {
+.app-navigation-primary {
   display: grid;
   width: 100%;
   gap: 4px;
 }
 
-.app-navigation-secondary {
-  margin-top: auto;
-}
-
-.app-navigation a,
-.app-more-trigger {
+.app-navigation a {
   display: flex;
   width: 100%;
   min-width: 0;
@@ -1081,31 +1075,23 @@ button:disabled {
   stroke-width: 1.6;
 }
 
-.app-navigation a:hover,
-.app-more-trigger:hover {
+.app-navigation a:hover {
   color: var(--ink);
   background: var(--hover);
 }
 
-.app-navigation a:focus-visible,
-.app-more-trigger:focus-visible {
+.app-navigation a:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
-.app-navigation a:active,
-.app-more-trigger:active {
+.app-navigation a:active {
   background: var(--active);
 }
 
-.app-navigation a.active,
-.app-more-trigger.active {
+.app-navigation a.active {
   color: var(--accent-ink);
   background: var(--accent-tint);
-}
-
-.app-more-trigger {
-  display: none;
 }
 
 .workspace-file-controls select,
@@ -1278,11 +1264,6 @@ button:disabled {
   font-size: 14px;
   font-weight: 700;
   text-align: center;
-}
-
-.app-more-scrim,
-.app-more-sheet {
-  display: none;
 }
 
 .app-shell,
@@ -4891,7 +4872,7 @@ video.media-preview {
   .app-navigation {
     display: grid;
     height: 100%;
-    grid-template-columns: minmax(0, 3fr) minmax(64px, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 0;
   }
 
@@ -4902,12 +4883,7 @@ video.media-preview {
     gap: 0;
   }
 
-  .app-navigation-secondary {
-    display: none;
-  }
-
-  .app-navigation a,
-  .app-more-trigger {
+  .app-navigation a {
     width: 100%;
     min-width: 0;
     min-height: 48px;
@@ -4916,133 +4892,12 @@ video.media-preview {
     font-size: 10px;
   }
 
-  .app-more-trigger {
-    display: flex;
-  }
-
   .app-navigation-icon {
     width: 21px;
     height: 21px;
   }
 
-  .app-more-scrim {
-    position: fixed;
-    z-index: 48;
-    inset: 0 0 calc(var(--app-mobile-nav-height) + var(--safe-bottom));
-    display: block;
-    width: 100%;
-    border: 0;
-    background: rgb(25 25 25 / 35%);
-  }
 
-  .app-more-sheet {
-    position: fixed;
-    z-index: 52;
-    right: max(8px, var(--safe-right));
-    bottom: calc(var(--app-mobile-nav-height) + var(--safe-bottom) + 8px);
-    left: max(8px, var(--safe-left));
-    display: grid;
-    max-height: calc(100dvh - var(--app-mobile-nav-height) - var(--safe-bottom) - 24px);
-    gap: 12px;
-    overflow-y: auto;
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 14px;
-    color: var(--ink);
-    background: var(--surface);
-    box-shadow: 0 18px 48px rgb(25 25 25 / 24%);
-  }
-
-  .app-more-heading-row {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .app-more-heading-row h2 {
-    margin: 0;
-    font-size: 15px;
-    font-weight: 700;
-  }
-
-  .app-more-close {
-    display: grid;
-    width: 44px;
-    min-width: 44px;
-    height: 44px;
-    place-items: center;
-    border: 0;
-    border-radius: 7px;
-    background: transparent;
-    cursor: pointer;
-  }
-
-  .app-more-links {
-    display: grid;
-    gap: 4px;
-  }
-
-  .app-more-links a {
-    display: grid;
-    min-height: 48px;
-    grid-template-columns: 28px minmax(0, 1fr);
-    align-items: center;
-    gap: 10px;
-    border-radius: 7px;
-    padding: 8px 10px;
-    color: var(--ink-secondary);
-    text-decoration: none;
-  }
-
-  .app-more-links a:hover {
-    color: var(--ink);
-    background: var(--hover);
-  }
-
-  .app-more-links a.active {
-    color: var(--accent-ink);
-    background: var(--accent-tint);
-  }
-
-  .theme-control--sheet {
-    display: grid;
-    gap: 8px;
-    border-top: 1px solid var(--hairline);
-    padding-top: 10px;
-  }
-
-  .theme-control--sheet h3 {
-    margin: 0;
-    color: var(--ink-secondary);
-    font-size: 13px;
-    font-weight: 650;
-  }
-
-  .theme-options--sheet {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 6px;
-  }
-
-  .theme-options--sheet button {
-    display: flex;
-    min-width: 0;
-    min-height: 52px;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    gap: 4px;
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    padding: 5px 3px;
-    font-size: 11px;
-    white-space: nowrap;
-  }
-
-  .theme-options--sheet button.selected {
-    border-color: var(--accent);
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -5054,4 +4909,120 @@ video.media-preview {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* 共通の補助操作は、画面右上に置く。 */
+.app-shell,
+.workspace-browser-shell,
+.schedules-page,
+.monitor-page,
+.extensions-page {
+  padding-top: calc(52px + var(--safe-top));
+}
+.app-more-menu {
+  position: fixed;
+  z-index: 52;
+  inset-block-start: max(4px, var(--safe-top));
+  inset-inline-end: max(8px, var(--safe-right));
+}
+.app-more-menu > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  list-style: none;
+}
+.app-more-menu > summary::-webkit-details-marker { display: none; }
+.app-more-menu :is(summary, a, button):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.app-more-panel {
+  position: absolute;
+  inset-inline-end: 0;
+  inset-block-start: calc(100% + 4px);
+  display: grid;
+  width: min(288px, calc(100vw - 20px));
+  max-height: calc(100dvh - 64px);
+  overflow-y: auto;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 12px 32px rgb(25 25 25 / 20%);
+}
+.app-more-links {
+  display: grid;
+  gap: 4px;
+}
+
+.app-more-links a {
+  display: grid;
+  min-height: 48px;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: var(--ink-secondary);
+  text-decoration: none;
+}
+
+.app-more-links a:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+
+.app-more-links a.active {
+  color: var(--accent-ink);
+  background: var(--accent-tint);
+}
+
+.theme-control--sheet {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--hairline);
+  padding-top: 10px;
+}
+
+.theme-control--sheet h3 {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.theme-options--sheet {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.theme-options--sheet button {
+  display: flex;
+  min-width: 0;
+  min-height: 52px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 3px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.theme-options--sheet button.selected {
+  border-color: var(--accent);
 }
