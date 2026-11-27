@@ -35,7 +35,7 @@ describe('AppNavigation', () => {
     expect(header).toContain('href="/extensions"');
     expect(header).toContain('aria-current="page"');
     expect(header).toContain('<details class="app-more-menu">');
-    expect(header).toContain('ほか');
+    expect(header).toContain('aria-label="メニュー"');
   });
 
   it('keeps the shared navigation fixed instead of overriding it per page', () => {

@@ -35,11 +35,10 @@ export function AppTopbar({ current }: { current: AppSurface }) {
         <AppNavigation current={current} />
       </div>
       <details ref={menuRef} className="app-more-menu">
-        <summary ref={summaryRef}>
+        <summary ref={summaryRef} aria-label="メニュー">
           <svg className="app-navigation-icon" viewBox="0 0 24 24" aria-hidden="true">
             <NavigationIcon icon="more" />
           </svg>
-          ほか
         </summary>
         <div className="app-more-panel">
           <nav className="app-more-links" aria-label="ほかの機能">
